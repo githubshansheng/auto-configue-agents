@@ -18,11 +18,13 @@ test('buildProviderToml：与旧工具 takeover 语义对齐', () => {
     'model_context_window = 272000',
     'base_url = "https://ai.heigh.vip/v1"',
     'wire_api = "responses"',
-    'env_key = "CODEX_CUSTOM_API_KEY"',
     'requires_openai_auth = false',
   ]) {
     assert.ok(toml.includes(want), '缺少 ' + want + '\n' + toml)
   }
+  // env_key 绝不能再出现：定义了 env_key 时 Codex 硬性校验环境变量，
+  // GUI（不读 shell rc）必报 Missing environment variable；鉴权统一走 auth.json
+  assert.ok(!toml.includes('env_key'), 'cc-switch TOML 不应包含 env_key\n' + toml)
 })
 
 test('insertRowAdaptive：自增 PK 跳过 / DEFAULT 省略 / NOT NULL 补零值', () => {

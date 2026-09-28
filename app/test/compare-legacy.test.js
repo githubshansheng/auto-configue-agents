@@ -4,6 +4,8 @@
 //    断言产出条目 schema 字段级一致（id/name/url/apiKey/上下文/输出上限/思考六档/能力开关）。
 // 2) Codex config.toml：TriConfig buildTOML 覆盖原版 ccswitch-codex-setup takeoverCodexConfig
 //    的全部硬保证（15721/v1、wire_api=responses、model/review_model、思考档位、上下文窗口、env_key）。
+//    注：仅 gpt-only 直连链路保留 env_key=TIANCAICONFIG_API_KEY；cc-switch 链路不写 env_key
+//    （投影后 requires_openai_auth=true 走 auth.json 鉴权，写 env_key 会让 GUI 必报 Missing env）。
 // 3) cc-switch 数据库：TriConfig configureProvider 覆盖原版 db.go 的全部关键字段。
 'use strict'
 

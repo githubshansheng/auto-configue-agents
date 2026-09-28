@@ -447,7 +447,9 @@ function buildProviderToml(relay, defaultModel) {
     'name = "custom"\n' +
     'base_url = "' + r + '/v1"\n' +
     'wire_api = "responses"\n' +
-    'env_key = "CODEX_CUSTOM_API_KEY"\n' +
+    // 不写 env_key：cc-switch 投影后 requires_openai_auth=true，鉴权走 ~/.codex/auth.json
+    // （cc-switch 写入 OPENAI_API_KEY）。若定义 env_key，Codex 会硬性校验该环境变量——
+    // GUI（ChatGPT.app）不读 shell rc，必报 Missing environment variable（2026-09-29 事故）。
     'requires_openai_auth = false\n' +
     'supports_websockets = false\n'
   )
