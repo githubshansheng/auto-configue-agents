@@ -1,0 +1,17 @@
+dist/
+web/node_modules/
+web/dist/
+internal/server/webdist/assets/
+*.zip
+.DS_Store
+node_modules/
+dist/
+dist-electron/
+web/dist/
+app/renderer/
+*.zip
+*.exe
+*.blockmap
+.DS_Store
+.workbuddy/
+*.log

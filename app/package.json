@@ -1,0 +1,55 @@
+{
+  "name": "tiancaiconfig-app",
+  "productName": "tiancaiConfig",
+  "version": "0.1.0",
+  "private": true,
+  "description": "tiancaiConfig - AI 工具第三方 API 一键配置器（Electron）",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "smoke": "electron . --smoke",
+    "dist": "electron-builder"
+  },
+  "build": {
+    "appId": "com.tiancaiconfig.app",
+    "productName": "tiancaiConfig",
+    "directories": {
+      "output": "../dist-electron",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "src/**/*",
+      "renderer/**/*"
+    ],
+    "asar": true,
+    "mac": {
+      "target": [
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "identity": null,
+      "category": "public.app-category.developer-tools"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    }
+  },
+  "devDependencies": {
+    "electron": "^44.4.5",
+    "electron-builder": "^26.15.3"
+  },
+  "dependencies": {
+  }
+}

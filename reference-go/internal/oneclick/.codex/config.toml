@@ -1,0 +1,10 @@
+review_model = "a-fast"
+model = "a-fast"
+model_provider = "triconfig"
+
+[model_providers.triconfig]
+name = "triconfig"
+base_url = "http://127.0.0.1:52012/v1"
+wire_api = "responses"
+env_key = "TRICONFIG_API_KEY"
+requires_openai_auth = false
