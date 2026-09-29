@@ -14,6 +14,13 @@
 // 绝不能整文件重写——只做行级原位替换，注释与其他段一字不动。
 // 鉴权说明：key 直接写入 model.api_key（hermes 官方注释支持的用法）；
 // 不用 env_key 类机制，GUI/网关/CLI 三种启动方式都从 config.yaml 读到。
+// 配置目录（HERMES_HOME，2026-09 真实机器确认）：Windows 官方安装器会写
+// 用户级持久变量 HERMES_HOME（指向 AppData\Local\hermes），hermes CLI 读配置
+// 的优先级是 $HERMES_HOME/config.yaml > ~/.hermes/config.yaml——因此配置必须
+// 写入 HERMES_HOME 指向的目录才生效；~/.hermes 仅为未设该变量时的缺省兜底。
+// 行尾规范化（2026-09 真实机器确认）：读取用 split(/\r?\n/) 兼容 CRLF；
+// 写入 atomicWrite 统一 join('\n') 把 CRLF 规范化为 LF——与 hermes 官方
+// hermes_cli/config.py atomic_config_write（PyYAML 默认 LF 输出）行为一致。
 'use strict'
 
 const fs = require('node:fs')
@@ -22,13 +29,46 @@ const { spawnSync } = require('node:child_process')
 
 const backupEngine = require('./backup')
 
-function configPath(home) {
-  return path.join(home, '.hermes', 'config.yaml')
+// hermesHome 解析配置目录：HERMES_HOME 环境变量（trim 后非空则用之，
+// Windows 官方安装器写入的用户级持久变量，CLI 读取优先级最高）；
+// 未设置/空白时兜底 ~/.hermes。
+function hermesHome(home) {
+  const env = String(process.env.HERMES_HOME || '').trim()
+  if (env) return env
+  return path.join(home, '.hermes')
 }
 
-// resolveCli 定位 hermes 可执行：~/.local/bin/hermes（官方安装器布局）→
-// ~/.hermes/hermes-agent/.hermes/bin/hermes（仓库布局）→ PATH。
-function resolveCli(home) {
+function configPath(home) {
+  return path.join(hermesHome(home), 'config.yaml')
+}
+
+// resolveCli 定位 hermes 可执行。
+// darwin/linux：~/.local/bin/hermes（官方安装器布局）→
+// ~/.hermes/hermes-agent/.hermes/bin/hermes（仓库布局）→ sh -c command -v。
+// win32（Windows 上 X_OK 不可靠、sh 通常不在 PATH，且 POSIX 路径无法直接
+// spawn）：AppData venv Scripts（git 安装实测布局）→ .local/bin → 仓库布局
+// （existsSync 判断）→ where.exe（取输出首个非空行的 win32 路径）。
+// opts 可注入（项目 DI 风格）：platform / spawn，默认取 process.platform /
+// spawnSync，调用方 resolveCli(home) 语义不变。
+function resolveCli(home, opts = {}) {
+  const platform = opts.platform || process.platform
+  const spawn = opts.spawn || spawnSync
+  if (platform === 'win32') {
+    const candidates = [
+      path.join(home, 'AppData', 'Local', 'hermes', 'hermes-agent', 'venv', 'Scripts', 'hermes.exe'),
+      path.join(home, '.local', 'bin', 'hermes.exe'),
+      path.join(home, '.hermes', 'hermes-agent', '.hermes', 'bin', 'hermes.exe'),
+    ]
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c
+    }
+    const r = spawn('where', ['hermes'], { encoding: 'utf8', timeout: 5000, windowsHide: true })
+    const first = String((r && r.stdout) || '')
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .find((l) => l.length > 0)
+    return first || ''
+  }
   const candidates = [
     path.join(home, '.local', 'bin', 'hermes'),
     path.join(home, '.hermes', 'hermes-agent', '.hermes', 'bin', 'hermes'),
@@ -39,7 +79,7 @@ function resolveCli(home) {
       return c
     } catch {}
   }
-  const r = spawnSync('sh', ['-c', 'command -v hermes'], { encoding: 'utf8', timeout: 5000 })
+  const r = spawn('sh', ['-c', 'command -v hermes'], { encoding: 'utf8', timeout: 5000 })
   const p = (r.stdout || '').trim()
   return p || ''
 }
@@ -142,7 +182,9 @@ function parseModelFields(lines) {
 }
 
 function readLines(p) {
-  return fs.readFileSync(p, 'utf8').split('\n')
+  // split(/\r?\n/) 统一消化 CRLF（真机证实：用户旧工具备份的 config.yaml 是
+  // CRLF 行尾，按 '\n' 切会残留 \r，使 loadModelSection 的 'model:' 精确匹配失败）。
+  return fs.readFileSync(p, 'utf8').split(/\r?\n/)
 }
 
 function atomicWrite(p, lines) {
@@ -156,7 +198,7 @@ function detect(home) {
   const cli = resolveCli(home)
   const result = { installed: false, configured: false, detail: '', paths: [p] }
   if (!fs.existsSync(p)) {
-    result.detail = '未检测到 ~/.hermes/config.yaml（未安装 Hermes 或尚未初始化）'
+    result.detail = '未检测到 ' + p + '（未安装 Hermes 或尚未初始化）'
     return result
   }
   result.installed = true
@@ -209,7 +251,7 @@ function backup(home) {
 // （gateway 非必装组件）。绝不能对未运行的 gateway 盲调 restart——既有副作用
 // 又可能挂住（2026-09-29 单测 4 分钟超时的教训）。
 function restartGatewayIfRunning(home, cli) {
-  const pidFile = path.join(home, '.hermes', 'gateway.pid')
+  const pidFile = path.join(hermesHome(home), 'gateway.pid')
   if (!fs.existsSync(pidFile)) return '（gateway 未在运行，跳过重启）'
   if (!cli) return '（未找到 hermes 命令，跳过 gateway 重启）'
   try {
@@ -239,9 +281,14 @@ function configure(home, cfg) {
 }
 
 // verify 两层：①读回断言三字段（服务提供方）与计划一致；②端到端 hermes -z "hi"
-// --model <默认模型> 真实调用——config 不写 default（实测无 default 时 hermes
-// 发空模型名 HTTP 400），探针必须显式指定模型（cfg.defaultModel，即工具默认
-// 模型，必在中转站模型列表内）。runProbe 可注入（测试桩 / 无 CLI 环境跳过）。
+// --provider custom --model <默认模型> 真实调用——config 不写 default（实测无
+// default 时 hermes 发空模型名 HTTP 400），探针必须显式指定模型（cfg.defaultModel，
+// 即工具默认模型，必在中转站模型列表内）。且必须显式 --provider custom：hermes
+// 0.19.1 oneshot（hermes_cli/oneshot.py）对 --model 不带 --provider 时会从模型名
+// 自动探测 provider（detect_provider_for_model），绕开 config.yaml 的 provider:
+// custom → 中转站独有模型探测不到归属（真机实测报 "No LLM provider configured"）；
+// 带 --provider custom 才走 config 三件套直连中转站。runProbe 可注入（测试桩 /
+// 无 CLI 环境跳过）。
 function verify(home, cfg, opts = {}) {
   const p = configPath(home)
   let fields
@@ -268,7 +315,9 @@ function verify(home, cfg, opts = {}) {
   const probeModel = String(cfg.defaultModel || '').trim() || 'glm-5.3-flash'
   let r
   try {
-    r = spawnSync(cli, ['-z', 'hi', '--model', probeModel], { encoding: 'utf8', timeout: 90000, cwd: home })
+    // 必须带 --provider custom：oneshot 的 --model 自动探测规则会绕开 config 的
+    // custom 提供方（中转站独有模型探测不到归属 → "No LLM provider configured"）
+    r = spawnSync(cli, ['-z', 'hi', '--provider', 'custom', '--model', probeModel], { encoding: 'utf8', timeout: 90000, cwd: home })
   } catch {
     return { ok: false, message: '端到端调用超时（90s），请检查中转站连通性' }
   }
@@ -286,6 +335,7 @@ function rollback(receipt) {
 
 module.exports = {
   configPath,
+  hermesHome,
   resolveCli,
   normalizeBase,
   loadModelSection,

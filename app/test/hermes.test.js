@@ -11,6 +11,16 @@ const path = require('node:path')
 const hermes = require('../src/engine/hermes')
 const registry = require('../src/engine/registry')
 
+// 真机可能带有用户级持久变量 HERMES_HOME（Windows 官方安装器写入）——本套件
+// 所有用例必须与真实环境隔离：先记录真机值（仅供真机回归用例显式使用），
+// 随即在套件内删除，让所有默认用例走 ~/.hermes 兜底（临时目录），结束时恢复。
+const REAL_HERMES_HOME = process.env.HERMES_HOME
+delete process.env.HERMES_HOME
+test.after(() => {
+  if (REAL_HERMES_HOME === undefined) delete process.env.HERMES_HOME
+  else process.env.HERMES_HOME = REAL_HERMES_HOME
+})
+
 // 模拟真实 config.yaml：带大量注释 + 生效 model 段 + 后续其他段
 const FIXTURE = `# Hermes Configuration
 # =============================================================================
@@ -238,4 +248,184 @@ test('restartGatewayIfRunning：无 gateway.pid / 无 cli 均跳过', () => {
   // gateway.pid 存在但无 cli → 仍跳过（不产生副作用）
   fs.writeFileSync(path.join(home, '.hermes', 'gateway.pid'), '123\n')
   assert.ok(hermes.restartGatewayIfRunning(home, '').includes('跳过'))
+})
+
+// —— resolveCli win32 分支（Windows 上 X_OK 不可靠、sh 不在 PATH，走 where.exe） ——
+
+test('resolveCli：win32 候选均不存在时走 where.exe，取首个非空行', () => {
+  const home = mkHome()
+  let spawnCalls = 0
+  const cli = hermes.resolveCli(home, {
+    platform: 'win32',
+    spawn: (cmd, args, o) => {
+      spawnCalls++
+      assert.strictEqual(cmd, 'where')
+      assert.deepStrictEqual(args, ['hermes'])
+      assert.strictEqual(o.windowsHide, true)
+      return { stdout: 'C:\\Users\\x\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\hermes.exe\nother.exe\n', status: 0 }
+    },
+  })
+  assert.strictEqual(cli, 'C:\\Users\\x\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\hermes.exe')
+  assert.strictEqual(spawnCalls, 1)
+})
+
+test('resolveCli：win32 候选存在（AppData venv Scripts 布局）直接返回，不调 where', () => {
+  const home = mkHome()
+  const venvCli = path.join(home, 'AppData', 'Local', 'hermes', 'hermes-agent', 'venv', 'Scripts', 'hermes.exe')
+  fs.mkdirSync(path.dirname(venvCli), { recursive: true })
+  fs.writeFileSync(venvCli, '')
+  let spawnCalls = 0
+  const cli = hermes.resolveCli(home, {
+    platform: 'win32',
+    spawn: () => {
+      spawnCalls++
+      return { stdout: '', status: 0 }
+    },
+  })
+  assert.strictEqual(cli, venvCli, '命中 AppData venv Scripts 候选（真实机器实测布局）')
+  assert.strictEqual(spawnCalls, 0, '候选存在时绝不调 spawn')
+})
+
+test('resolveCli：win32 where 失败（status=1）返回空串', () => {
+  const home = mkHome()
+  const cli = hermes.resolveCli(home, {
+    platform: 'win32',
+    spawn: () => ({ stdout: '', status: 1 }),
+  })
+  assert.strictEqual(cli, '')
+})
+
+test('resolveCli：darwin 回归——候选命中 ~/.local/bin/hermes 且不调 spawn', () => {
+  const home = mkHome()
+  const posixCli = path.join(home, '.local', 'bin', 'hermes')
+  fs.mkdirSync(path.dirname(posixCli), { recursive: true })
+  fs.writeFileSync(posixCli, '#!/bin/sh\n')
+  let spawnCalls = 0
+  const cli = hermes.resolveCli(home, {
+    platform: 'darwin',
+    spawn: () => {
+      spawnCalls++
+      return { stdout: '', status: 0 }
+    },
+  })
+  assert.strictEqual(cli, posixCli)
+  assert.strictEqual(spawnCalls, 0, 'darwin 候选命中时绝不调 spawn')
+})
+
+// —— hermesHome / configPath：HERMES_HOME 环境变量感知（Windows 官方安装器
+// 会写用户级 HERMES_HOME，CLI 读 $HERMES_HOME/config.yaml 优先于 ~/.hermes） ——
+
+// 保存-恢复 process.env.HERMES_HOME 的隔离执行器（try/finally 保证用例间无泄漏）
+function withHermesHomeEnv(value, fn) {
+  const saved = process.env.HERMES_HOME
+  try {
+    if (value === undefined) delete process.env.HERMES_HOME
+    else process.env.HERMES_HOME = value
+    return fn()
+  } finally {
+    if (saved === undefined) delete process.env.HERMES_HOME
+    else process.env.HERMES_HOME = saved
+  }
+}
+
+test('hermesHome/configPath：设 HERMES_HOME → 用其目录而非 ~/.hermes', () => {
+  withHermesHomeEnv(os.tmpdir(), () => {
+    const home = mkHome()
+    assert.strictEqual(hermes.hermesHome(home), os.tmpdir())
+    assert.strictEqual(hermes.configPath(home), path.join(os.tmpdir(), 'config.yaml'))
+  })
+})
+
+test('hermesHome/configPath：未设置 HERMES_HOME → 兜底 ~/.hermes', () => {
+  withHermesHomeEnv(undefined, () => {
+    const home = mkHome()
+    assert.strictEqual(hermes.hermesHome(home), path.join(home, '.hermes'))
+    assert.strictEqual(hermes.configPath(home), path.join(home, '.hermes', 'config.yaml'))
+  })
+})
+
+test('hermesHome/configPath：空串/纯空白 HERMES_HOME 视为未设置（走兜底）', () => {
+  const home = mkHome()
+  withHermesHomeEnv('', () => {
+    assert.strictEqual(hermes.hermesHome(home), path.join(home, '.hermes'))
+  })
+  withHermesHomeEnv('   \t ', () => {
+    assert.strictEqual(hermes.hermesHome(home), path.join(home, '.hermes'))
+    assert.strictEqual(hermes.configPath(home), path.join(home, '.hermes', 'config.yaml'))
+  })
+})
+
+test('hermesHome 真机回归：真机 HERMES_HOME（Windows 安装器写入）优先于 ~/.hermes', (t) => {
+  if (!REAL_HERMES_HOME || !String(REAL_HERMES_HOME).trim()) {
+    t.skip('本机未设置 HERMES_HOME，跳过真机回归')
+    return
+  }
+  // 显式注入真机值（套件顶部已删除环境变量作隔离），断言真实机器 P0 缺陷的回归防线
+  withHermesHomeEnv(String(REAL_HERMES_HOME).trim(), () => {
+    const home = mkHome()
+    assert.strictEqual(hermes.hermesHome(home), String(REAL_HERMES_HOME).trim())
+    assert.strictEqual(hermes.configPath(home), path.join(String(REAL_HERMES_HOME).trim(), 'config.yaml'))
+  })
+})
+
+test('HERMES_HOME 环境隔离：withHermesHomeEnv 用例后恢复原值', () => {
+  const saved = process.env.HERMES_HOME
+  withHermesHomeEnv('X:\\fake\\hermes', () => {})
+  assert.strictEqual(process.env.HERMES_HOME, saved, '用例结束后必须恢复 HERMES_HOME')
+})
+
+// —— 行尾兼容（真机证实：用户旧工具备份的 config.yaml 是 CRLF，'\n' 切分残留
+//    \r 会让 loadModelSection 的 'model:' 精确匹配失败 → 拒绝盲写） ——
+
+// 纯 CRLF fixture：与 FIXTURE 同结构（provider/base_url 未注释、api_key 注释态、default 存在）
+const CRLF_FIXTURE = FIXTURE.replace(/\n/g, '\r\n')
+
+test('CRLF config：applyEdits/parseModelFields 正常，configure 后三件套生效且 default 原样', () => {
+  const home = mkHome()
+  fs.writeFileSync(hermes.configPath(home), CRLF_FIXTURE)
+  // 解析层：CRLF 不再导致 'model:' 匹配失败
+  const fields = hermes.parseModelFields(fs.readFileSync(hermes.configPath(home), 'utf8').split(/\r?\n/))
+  assert.strictEqual(fields.provider, 'auto')
+  // 写入层：configure 不再抛「未找到顶层 model: 段」
+  hermes.configure(home, CFG)
+  const out = fs.readFileSync(hermes.configPath(home), 'utf8')
+  assert.ok(out.includes('  provider: "custom"'), out)
+  assert.ok(out.includes('  base_url: "https://ai.heigh.vip/v1"'), out)
+  assert.ok(/^  api_key: "sk-test-abc123"$/m.test(out), out)
+  assert.ok(out.includes('  default: "anthropic/claude-opus-4.6"'), 'default 行原样保留')
+})
+
+test('CRLF 写入规范化：configure 后文件统一为 LF（与 hermes 官方 PyYAML 输出一致）', () => {
+  const home = mkHome()
+  fs.writeFileSync(hermes.configPath(home), CRLF_FIXTURE)
+  hermes.configure(home, CFG)
+  const out = fs.readFileSync(hermes.configPath(home), 'utf8')
+  assert.ok(!out.includes('\r'), '写入产物必须无 \\r（CRLF 已规范化为 LF）')
+})
+
+test('混合行尾（部分 \\n 部分 \\r\\n）也能解析与配置', () => {
+  const home = mkHome()
+  // 手工构造：model: 行前是 LF，段内行是 CRLF，段后 agent: 行又是 LF
+  const mixed = [
+    '# Hermes Configuration',
+    'model:',
+    '  default: "anthropic/claude-opus-4.6"',
+    '  provider: "auto"',
+    '  # api_key: "your-key-here"',
+    '  base_url: "https://openrouter.ai/api/v1"',
+    'agent:',
+    '  name: "my-agent"',
+  ]
+  const content = [
+    mixed.slice(0, 2).join('\n'), // LF 部分
+    mixed.slice(2, 6).join('\r\n'), // CRLF 部分
+    mixed.slice(6).join('\n'), // LF 部分
+  ].join('\n')
+  fs.writeFileSync(hermes.configPath(home), content)
+  hermes.configure(home, CFG)
+  const out = fs.readFileSync(hermes.configPath(home), 'utf8')
+  assert.ok(out.includes('  provider: "custom"'), out)
+  assert.ok(out.includes('  base_url: "https://ai.heigh.vip/v1"'), out)
+  assert.ok(/^  api_key: "sk-test-abc123"$/m.test(out), out)
+  assert.ok(out.includes('  name: "my-agent"'), '后续段原样')
 })
