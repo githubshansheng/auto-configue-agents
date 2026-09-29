@@ -37,7 +37,7 @@ jobs:
 
       - name: Build mac zip (arm64 + x64)
         working-directory: app
-        run: npx electron-builder --mac zip
+        run: npx electron-builder --mac zip --x64 --arm64
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
