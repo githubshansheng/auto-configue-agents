@@ -57,16 +57,17 @@ function writeFixture(home) {
 
 const CFG = { baseUrl: 'https://ai.heigh.vip', apiKey: 'sk-test-abc123', defaultModel: 'glm-5.3-flash' }
 
-test('applyEdits：四字段生效 + api_key 注释行激活 + 注释与其他段零改动', () => {
+test('applyEdits：三字段生效 + default 行绝不触碰 + 注释与其他段零改动', () => {
   const home = mkHome()
   writeFixture(home)
   hermes.configure(home, CFG)
   const out = fs.readFileSync(hermes.configPath(home), 'utf8')
-  // 生效字段
-  assert.ok(out.includes('  default: "glm-5.3-flash"'), out)
+  // 生效字段（服务提供方三件套）
   assert.ok(out.includes('  provider: "custom"'), out)
   assert.ok(out.includes('  base_url: "https://ai.heigh.vip/v1"'), out)
   assert.ok(/^  api_key: "sk-test-abc123"$/m.test(out), out)
+  // default 行原样保留（工具绝不代选模型，用户在 hermes GUI 刷新模型后自选）
+  assert.ok(out.includes('  default: "anthropic/claude-opus-4.6"'), 'default 行必须原样保留')
   // 注释行保留（api_key 原注释行被激活，其余注释原样）
   assert.ok(out.includes('#   "auto"         - Auto-detect from credentials (default)'), 'provider 注释保留')
   assert.ok(out.includes('# streaming: true'), '段尾注释保留')
@@ -74,9 +75,9 @@ test('applyEdits：四字段生效 + api_key 注释行激活 + 注释与其他�
   // 其他段零改动
   assert.ok(out.includes('agent:\n  name: "my-agent"\n  workspace: "/tmp/ws"'), 'agent 段原样')
   assert.ok(out.includes('gateway:\n  platform: "telegram"'), 'gateway 段原样')
-  // 旧值清除
-  assert.ok(!out.includes('anthropic/claude-opus-4.6'), '旧 default 清除')
+  // 旧 base_url 清除
   assert.ok(!out.includes('openrouter.ai'), '旧 base_url 清除')
+  assert.ok(!out.includes('glm-5.3-flash'), '工具绝不写入 default 模型')
 })
 
 test('幂等：重跑一次产物逐字节一致', () => {
@@ -100,6 +101,19 @@ test('已配置 api_key 的 config：直接替换不重复插入', () => {
   assert.ok(!out.includes('sk-test-abc123'), '旧 key 清除')
 })
 
+test('default 行为注释态（用户从未选过模型）时：三字段写入，注释不动', () => {
+  const home = mkHome()
+  // fixture 中 default 是未注释生效行；改成注释态模拟「用户从未在 hermes 选过模型」
+  fs.writeFileSync(hermes.configPath(home), FIXTURE.replace('  default: "anthropic/claude-opus-4.6"', '  # default: "anthropic/claude-opus-4.6"'))
+  hermes.configure(home, CFG)
+  const out = fs.readFileSync(hermes.configPath(home), 'utf8')
+  assert.ok(out.includes('  provider: "custom"'), out)
+  assert.ok(out.includes('  base_url: "https://ai.heigh.vip/v1"'), out)
+  // 注释态 default 保持注释，绝不被激活或改写
+  assert.ok(out.includes('  # default: "anthropic/claude-opus-4.6"'), '注释态 default 保持注释')
+  assert.ok(!/^  default:/m.test(out), '不得产生未注释 default 行')
+})
+
 test('verify：读回断言通过 + 探针桩成功', () => {
   const home = mkHome()
   writeFixture(home)
@@ -107,6 +121,22 @@ test('verify：读回断言通过 + 探针桩成功', () => {
   const r = hermes.verify(home, CFG, { runProbe: () => ({ ok: true, detail: 'HTTP 200' }) })
   assert.ok(r.ok, r.message)
   assert.ok(r.message.includes('端到端'))
+})
+
+test('verify：无 CLI 时用注入探针校验（--model 显式指定的设计约定）', () => {
+  const home = mkHome()
+  writeFixture(home)
+  hermes.configure(home, CFG)
+  // runProbe 桩模拟真实探针行为：config 无 default，探针必须用 --model 显式指定
+  let probeArg = ''
+  const r = hermes.verify(home, CFG, {
+    runProbe: (h, c) => {
+      probeArg = c.defaultModel || ''
+      return { ok: !!probeArg, detail: '--model ' + probeArg }
+    },
+  })
+  assert.ok(r.ok, r.message)
+  assert.strictEqual(probeArg, 'glm-5.3-flash', '探针用 cfg.defaultModel 显式指定模型')
 })
 
 test('verify：字段被外部改动 → fail', () => {
@@ -173,16 +203,32 @@ test('registry 集成：hermes 目标可发现且 detect 返回 id', () => {
   assert.strictEqual(t.autoupdate, undefined, '未适配自动更新，不应有 autoupdate 字段')
 })
 
-test('plan：diff 报告四字段旧值→新值，api_key 脱敏', () => {
+test('plan：diff 报告三字段旧值→新值（不含 default），api_key 脱敏', () => {
   const home = mkHome()
   writeFixture(home)
   const items = hermes.plan(home, CFG)
   assert.strictEqual(items.length, 1)
   const s = items[0].summary
-  assert.ok(s.includes('anthropic/claude-opus-4.6'), s)
-  assert.ok(s.includes('glm-5.3-flash'), s)
+  assert.ok(s.includes('provider'), s)
+  assert.ok(s.includes('base_url'), s)
   assert.ok(s.includes('sk-tes***'), 'key 脱敏：' + s)
   assert.ok(!s.includes('sk-test-abc123'), '完整 key 不出现在 diff：' + s)
+  // diff 结构里绝不含 default 字段（文案中说明「不动 default」允许出现）
+  const diffKeys = items[0].diff.map((d) => d.key)
+  assert.ok(!diffKeys.includes('default'), 'diff 绝不涉及 default 字段：' + diffKeys.join(','))
+  assert.deepStrictEqual(diffKeys.sort(), ['api_key', 'base_url', 'provider'])
+})
+
+test('设计约定：hermes 只配置服务提供方，模型全量交给 hermes 刷新获取', () => {
+  const home = mkHome()
+  writeFixture(home)
+  hermes.configure(home, CFG)
+  const out = fs.readFileSync(hermes.configPath(home), 'utf8')
+  assert.ok(out.includes('base_url: "https://ai.heigh.vip/v1"'), '必须直连中转站')
+  assert.strictEqual(hermes.normalizeBase('https://x.example'), 'https://x.example/v1', 'normalizeBase 恒拼 /v1（chat/completions 端点）')
+  // editPlan 只含三件套，绝不含 default
+  const planKeys = Object.keys(hermes.editPlan(CFG))
+  assert.deepStrictEqual(planKeys.sort(), ['api_key', 'base_url', 'provider'], 'editPlan 仅三字段')
 })
 
 test('restartGatewayIfRunning：无 gateway.pid / 无 cli 均跳过', () => {

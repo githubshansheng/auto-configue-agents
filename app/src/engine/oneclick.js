@@ -221,7 +221,9 @@ async function run({ home, request, emit, signal, persistEnv, ccswitchApi, autou
 
   // 5. 生成写入计划（干跑，不落盘；Codex 与 WorkBuddy 使用各自的 baseUrl/默认模型）
   stage('plan', 'running', '')
-  // hermes 与 WorkBuddy 同面：直连中转站 + 全量勾选模型 + 同一默认模型
+  // hermes 与 WorkBuddy 同面：直连中转站。hermes 只消费服务提供方三件套
+  // （provider/base_url/api_key），defaultModel 仅作 verify 端到端探针的
+  // --model 参数（config.yaml 绝不写 default，模型由 hermes 刷新模型后自选）。
   const cfgOf = (t) => (t.id === 'workbuddy' || t.id === 'hermes' ? cfgWB : cfgCodex)
   const allChanges = []
   for (const t of targets) {

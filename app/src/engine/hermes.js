@@ -1,9 +1,15 @@
-// Hermes Agent 目标：~/.hermes/config.yaml 原位编辑（model: 段四字段）。
-// 设计约定（2026-09-29 用户定规）：hermes 是 chat/completions 兼容客户端，
-// 直连第三方 API（中转站 base_url + api_key 直写 config）——绝不指向
-// cc-switch 本地路由（127.0.0.1:15721），也不依赖 cc-switch 模型目录；
-// 一键配置流程中 cc-switch 阶段仅由 Codex 目标触发（oneclick.codexSelected）。
-// 直连中转站（OpenAI 兼容）：provider="custom" + base_url + api_key + default 模型。
+// Hermes Agent 目标：~/.hermes/config.yaml 原位编辑（只写服务提供方三件套）。
+// 设计约定（2026-09-29 用户定规）：
+// 1) hermes 是 chat/completions 兼容客户端，直连第三方 API（中转站 base_url +
+//    api_key 直写 config）——绝不指向 cc-switch 本地路由（127.0.0.1:15721），
+//    也不依赖 cc-switch 模型目录；一键配置流程中 cc-switch 阶段仅由 Codex
+//    目标触发（oneclick.codexSelected）。
+// 2) 只配置「服务提供方」（provider="custom" + base_url + api_key 三件套），
+//    绝不写 default 模型——hermes GUI 添加服务方后「刷新模型」即可拉取全量
+//    模型清单，模型由用户在 hermes 中自选；default 行原样保留（用户在 GUI
+//    选过就留着，没选过就保持注释态）。实测：无 default 时 hermes 发空模型名
+//    （HTTP 400 Model name not specified），所以端到端探针必须用 --model 显式
+//    指定模型（cfg.defaultModel，即工具默认模型）。
 // 关键约束：config.yaml 是 hermes 的完整主配置（500+ 行注释 + 用户自定义段），
 // 绝不能整文件重写——只做行级原位替换，注释与其他段一字不动。
 // 鉴权说明：key 直接写入 model.api_key（hermes 官方注释支持的用法）；
@@ -48,10 +54,10 @@ function yamlQuote(v) {
   return '"' + String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
 }
 
-// 编辑计划：model 段内需生效的四字段目标值。
+// 编辑计划：model 段内需生效的三字段目标值（服务提供方三件套）。
+// 故意不含 default——模型由用户在 hermes GUI 刷新模型后自选，工具绝不代选。
 function editPlan(cfg) {
   return {
-    default: yamlQuote(cfg.defaultModel || ''),
     provider: '"custom"',
     base_url: yamlQuote(normalizeBase(cfg.baseUrl)),
     api_key: yamlQuote(cfg.apiKey || ''),
@@ -79,14 +85,15 @@ function loadModelSection(lines) {
   return { start, end }
 }
 
-// applyEdits 对行数组原位应用 model 段四字段。返回 { lines, changed: [...], missing: [...] }。
-// 只动段内「未注释的目标键行」；api_key 若无未注释行则插到 provider 行之后。
+// applyEdits 对行数组原位应用 model 段三字段（服务提供方）。返回 { lines, changed: [...], missing: [...] }。
+// 只动段内「未注释的目标键行」；default 行绝不触碰（用户在 hermes GUI 自选模型，
+// 选过就保留）；api_key 若无未注释行则插到 provider 行之后。
 function applyEdits(lines, plan) {
   const sec = loadModelSection(lines)
   if (!sec) throw new Error('config.yaml 中未找到顶层 model: 段（结构异常，拒绝盲写）')
   const out = lines.slice()
   const changed = []
-  const wanted = ['default', 'provider', 'base_url', 'api_key']
+  const wanted = ['provider', 'base_url', 'api_key']
   let providerLine = -1
   for (let i = sec.start + 1; i < sec.end; i++) {
     const m = out[i].match(/^(\s*)(#?\s*)([A-Za-z_]+)(\s*:)/)
@@ -108,10 +115,8 @@ function applyEdits(lines, plan) {
   // api_key 无未注释行 → 插到 provider 行后（provider 行自身也可能刚替换过）
   if (!changed.includes('api_key')) {
     if (providerLine === -1) {
-      // 段内无未注释 provider 行（异常但可救）：插到段首 default 之后或段首
-      let at = sec.start + 1
-      if (changed.includes('default')) at = out.findIndex((l, i) => i > sec.start && l.match(/^\s+default:/)) + 1
-      out.splice(at, 0, '  api_key: ' + plan.api_key)
+      // 段内无未注释 provider 行（异常但可救）：插到段首
+      out.splice(sec.start + 1, 0, '  api_key: ' + plan.api_key)
     } else {
       out.splice(providerLine + 1, 0, '  api_key: ' + plan.api_key)
     }
@@ -168,7 +173,7 @@ function detect(home) {
   }
   if (fields && fields.provider === 'custom') {
     result.configured = true
-    result.detail = '已配置 custom 中转（' + (fields.base_url || '?') + '，默认模型 ' + (fields.default || '?') + '）'
+    result.detail = '已配置 custom 中转（' + (fields.base_url || '?') + '）；模型在 Hermes 中「刷新模型」后自选' + (fields.default ? '，当前选中 ' + fields.default : '')
   } else {
     result.detail = '已安装 Hermes（当前 provider: ' + ((fields && fields.provider) || '?') + '，配置后将直连中转站）'
   }
@@ -184,12 +189,12 @@ function plan(home, cfg) {
   } catch {
     old = {}
   }
-  const items = ['default', 'provider', 'base_url', 'api_key'].map((k) => {
+  const items = ['provider', 'base_url', 'api_key'].map((k) => {
     const ov = k === 'api_key' && old[k] ? old[k].slice(0, 6) + '***' : old[k] || '（未设置）'
     const nv = k === 'api_key' ? (cfg.apiKey || '').slice(0, 6) + '***' : planMap[k].replace(/^"|"$/g, '')
     return { key: k, from: ov, to: nv }
   })
-  const summary = '原位更新 model 段：' + items.map((i) => i.key + ' ' + i.from + ' → ' + i.to).join('；')
+  const summary = '原位更新 model 段（仅服务提供方，不动 default 模型）：' + items.map((i) => i.key + ' ' + i.from + ' → ' + i.to).join('；')
   return [{ file: p, summary, diff: items }]
 }
 
@@ -221,7 +226,7 @@ function configure(home, cfg) {
   const lines = readLines(p)
   const before = lines.join('\n')
   const { lines: out, changed, missing } = applyEdits(lines, editPlan(cfg))
-  if (missing.length === 4) throw new Error('model 段无可编辑字段（config 结构异常）')
+  if (missing.length === 3) throw new Error('model 段无可编辑字段（config 结构异常）')
   const after = out.join('\n')
   if (before !== after) atomicWrite(p, out)
   const gw = restartGatewayIfRunning(home, resolveCli(home))
@@ -233,8 +238,10 @@ function configure(home, cfg) {
   ]
 }
 
-// verify 两层：①读回断言四字段与计划一致；②端到端 hermes -z "hi" 真实调用。
-// runProbe 可注入（测试桩 / 未来无 CLI 环境跳过）。
+// verify 两层：①读回断言三字段（服务提供方）与计划一致；②端到端 hermes -z "hi"
+// --model <默认模型> 真实调用——config 不写 default（实测无 default 时 hermes
+// 发空模型名 HTTP 400），探针必须显式指定模型（cfg.defaultModel，即工具默认
+// 模型，必在中转站模型列表内）。runProbe 可注入（测试桩 / 无 CLI 环境跳过）。
 function verify(home, cfg, opts = {}) {
   const p = configPath(home)
   let fields
@@ -245,7 +252,7 @@ function verify(home, cfg, opts = {}) {
   }
   if (!fields) return { ok: false, message: 'config.yaml 中未找到 model: 段' }
   const want = editPlan(cfg)
-  for (const k of ['default', 'provider', 'base_url']) {
+  for (const k of ['provider', 'base_url']) {
     if (fields[k] !== want[k].replace(/^"|"$/g, '')) {
       return { ok: false, message: k + ' 不一致：期望 ' + want[k] + '，实际 ' + (fields[k] || '（空）') }
     }
@@ -258,18 +265,19 @@ function verify(home, cfg, opts = {}) {
   }
   const cli = resolveCli(home)
   if (!cli) return { ok: true, message: '校验通过（配置一致；未找到 hermes 命令，跳过端到端调用）' }
+  const probeModel = String(cfg.defaultModel || '').trim() || 'glm-5.3-flash'
   let r
   try {
-    r = spawnSync(cli, ['-z', 'hi'], { encoding: 'utf8', timeout: 90000, cwd: home })
+    r = spawnSync(cli, ['-z', 'hi', '--model', probeModel], { encoding: 'utf8', timeout: 90000, cwd: home })
   } catch {
     return { ok: false, message: '端到端调用超时（90s），请检查中转站连通性' }
   }
   const outAll = ((r.stdout || '') + '\n' + (r.stderr || '')).trim()
-  if (/agent failed|not connected|Missing environment/i.test(outAll)) {
+  if (/agent failed|not connected|Missing environment|malformed|Model name not specified/i.test(outAll)) {
     return { ok: false, message: '端到端调用失败：' + outAll.split('\n').slice(-2).join(' ').slice(0, 300) }
   }
   if (!outAll) return { ok: false, message: '端到端调用无输出（exit=' + r.status + '）' }
-  return { ok: true, message: '校验通过（配置一致 + hermes 实际调用成功，exit=' + r.status + '）' }
+  return { ok: true, message: '校验通过（配置一致 + hermes 实际调用成功（--model ' + probeModel + '），exit=' + r.status + '）' }
 }
 
 function rollback(receipt) {
