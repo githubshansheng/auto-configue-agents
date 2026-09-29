@@ -1,0 +1,45 @@
+name: build-mac
+
+# tiancaiConfig macOS 打包：Windows 无法交叉打 mac zip（symlink/签名链路受限），
+# 由 macOS runner 官方环境构建。产物为未签名 zip（无 Apple 开发者账号），
+# mac 用户首次打开需「右键 → 打开」绕过 Gatekeeper。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-mac.yml'
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build web (React 前端 → app/renderer)
+        working-directory: web
+        run: |
+          npm install
+          npm run build
+
+      - name: Install app deps
+        working-directory: app
+        run: npm install
+
+      - name: Build mac zip (arm64 + x64)
+        working-directory: app
+        run: npx electron-builder --mac zip
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiancaiConfig-mac-zip
+          path: dist-electron/*.zip
+          if-no-files-found: error
