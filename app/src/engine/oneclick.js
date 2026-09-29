@@ -211,7 +211,7 @@ async function run({ home, request, emit, signal, persistEnv, ccswitchApi, autou
       stage(
         'ccswitch',
         'ok',
-        'cc-switch 就绪（' + cp.note + '，模型目录 ' + cp.models + ' 条；' + cp.settingsNote + (ready.initialized ? '；已完成首启初始化' : '') + (autoMsg ? '；' + autoMsg : '') + '）'
+        'cc-switch 就绪（' + cp.note + '，模型目录 ' + cp.models + ' 条；' + cp.settingsNote + (ready.initialized ? '；已完成首启初始化' : '') + (ready.upgraded ? '；已自动升级 v' + ready.from + ' → v' + ready.to : '') + (autoMsg ? '；' + autoMsg : '') + '）'
       )
     } catch (e) {
       fail('ccswitch', 'cc-switch 配置失败：' + e.message)
@@ -282,6 +282,11 @@ async function run({ home, request, emit, signal, persistEnv, ccswitchApi, autou
   if (codexSelected) {
     try {
       auCodex.rememberGateway(home, { base, apiKey: request.apiKey, mode: codexMode })
+    } catch {}
+    // Codex 模型目录收口：cc-switch 投影模板默认 medium 且缺 max 档，与产品要求
+    // （默认 xhigh、全模型可选到 max）不符；文件存在即幂等修正，失败不阻断管线。
+    try {
+      cc.syncCodexModelCatalog(home)
     } catch {}
   }
 

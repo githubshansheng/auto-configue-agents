@@ -27,6 +27,50 @@ test('buildProviderToml：与旧工具 takeover 语义对齐', () => {
   assert.ok(!toml.includes('env_key'), 'cc-switch TOML 不应包含 env_key\n' + toml)
 })
 
+test('syncCodexModelCatalog：cc-switch 投影目录统一为默认 xhigh + 五档含 max', () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'tiancai-cat-'))
+  try {
+    const p = cc.codexCatalogPath(tmpHome)
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, JSON.stringify({
+      models: [
+        { slug: 'glm-5.3-flash', priority: 1005, default_reasoning_level: 'medium', supported_reasoning_levels: [
+          { description: 'd-low', effort: 'low' },
+          { description: 'd-medium', effort: 'medium' },
+          { description: 'd-high', effort: 'high' },
+          { description: 'd-xhigh', effort: 'xhigh' },
+        ] },
+        { slug: 'gpt-5.6-sol', priority: 1000, default_reasoning_level: 'high', supported_reasoning_levels: [] },
+      ],
+    }))
+    const msg = cc.syncCodexModelCatalog(tmpHome)
+    const cat = JSON.parse(fs.readFileSync(p, 'utf8'))
+    for (const m of cat.models) {
+      assert.strictEqual(m.default_reasoning_level, 'xhigh', m.slug + ' 默认思考量应为 xhigh')
+      const efforts = m.supported_reasoning_levels.map((l) => l.effort)
+      assert.deepStrictEqual(efforts, ['low', 'medium', 'high', 'xhigh', 'max'], m.slug + ' 档位应统一五档含 max')
+      for (const l of m.supported_reasoning_levels) assert.ok(l.description, '档位描述不应为空')
+    }
+    assert.ok(msg.includes('2 个模型'), '消息应包含模型数：' + msg)
+    // 幂等：再次执行不再变更
+    const msg2 = cc.syncCodexModelCatalog(tmpHome)
+    assert.ok(msg2.includes('已符合要求'), '二次执行应幂等：' + msg2)
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true })
+  }
+})
+
+test('syncCodexModelCatalog：文件不存在时跳过不创建', () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'tiancai-cat-'))
+  try {
+    const msg = cc.syncCodexModelCatalog(tmpHome)
+    assert.ok(msg.includes('跳过'), '应提示跳过：' + msg)
+    assert.strictEqual(fs.existsSync(cc.codexCatalogPath(tmpHome)), false, '不应创建新文件')
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true })
+  }
+})
+
 test('insertRowAdaptive：自增 PK 跳过 / DEFAULT 省略 / NOT NULL 补零值', () => {
   const Database = require('node:sqlite').DatabaseSync
   const db = new Database(':memory:')
@@ -155,10 +199,22 @@ test('setAutostart：darwin 分支写 plist 并 launchctl load（命令注入桩
 
 test('detectCC：无安装时给出自动安装提示', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'triconfig-det-'))
-  // 注入空扫描目录：与机器真实安装状态（/Applications 可能有 cc-switch）隔离
-  const det = cc.detectCC(home, { scanDirs: [path.join(home, 'Applications')] })
-  assert.strictEqual(det.installed, false)
-  assert.ok(/自动下载安装/.test(det.detail), '提示应含自动安装: ' + det.detail)
+  // 注入空扫描目录：与机器真实安装状态（/Applications 可能有 cc-switch）隔离。
+  // 注意：scanDirs 注入仅对 darwin 分支生效；win32 分支按 LOCALAPPDATA/APPDATA/
+  // ProgramFiles 扫描真实环境，需同步改写环境变量到空目录才能隔离。
+  const envKeys = ['LOCALAPPDATA', 'APPDATA', 'ProgramFiles', 'ProgramFiles(x86)']
+  const savedEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]))
+  for (const k of envKeys) process.env[k] = path.join(home, 'env-empty')
+  try {
+    const det = cc.detectCC(home, { scanDirs: [path.join(home, 'Applications')] })
+    assert.strictEqual(det.installed, false)
+    assert.ok(/自动下载安装/.test(det.detail), '提示应含自动安装: ' + det.detail)
+  } finally {
+    for (const k of envKeys) {
+      if (savedEnv[k] === undefined) delete process.env[k]
+      else process.env[k] = savedEnv[k]
+    }
+  }
 })
 
 test('configureProvider：旧版「TriConfig 中转」行原地更新并改名（更名迁移）', () => {
@@ -344,4 +400,139 @@ test('mac ccPids/ccRunning：新模式在本机进程表上可执行', { skip: p
   assert.ok(Array.isArray(pids), '应返回 pid 数组')
   for (const p of pids) assert.ok(Number.isInteger(p) && p > 0, 'pid 应为正整数: ' + p)
   assert.strictEqual(typeof cc.ccRunning(), 'boolean')
+})
+
+test('parseVersion / versionAtLeast：语义化版本比较（逐段数值、缺段补零）', () => {
+  assert.deepStrictEqual(cc.parseVersion('3.20.3'), [3, 20, 3])
+  assert.deepStrictEqual(cc.parseVersion('v3.20.3'), [3, 20, 3])
+  assert.deepStrictEqual(cc.parseVersion('3.21.0-beta.1'), [3, 21, 0], '预发布后缀截断忽略')
+  assert.deepStrictEqual(cc.parseVersion('cc-switch 3.20.3 (abc123)'), [3, 20, 3], '应从混合文本提取')
+  assert.deepStrictEqual(cc.parseVersion('3.20'), [3, 20])
+  assert.strictEqual(cc.parseVersion(''), null)
+  assert.strictEqual(cc.parseVersion('not-a-version'), null)
+
+  assert.strictEqual(cc.versionAtLeast('3.20.3', '3.20.3'), true)
+  assert.strictEqual(cc.versionAtLeast('3.20.3', '3.20.2'), true)
+  assert.strictEqual(cc.versionAtLeast('3.20.3', '3.21.0'), false)
+  assert.strictEqual(cc.versionAtLeast('3.20', '3.20.0'), true, '缺段按 0 补齐')
+  assert.strictEqual(cc.versionAtLeast('3.20.1', '3.20'), true)
+  assert.strictEqual(cc.versionAtLeast('v3.9.9', '3.10.0'), false, '逐段数值比较，不做字符串比较')
+  assert.strictEqual(cc.versionAtLeast('', '3.20.3'), false)
+  assert.strictEqual(cc.versionAtLeast('3.20.3', null), false)
+})
+
+test('installedCCVersion：读文件版本信息解析 x.y.z / 失败返回空（CLI 探测已证伪，Tauri GUI 不处理 --version/-V）', () => {
+  // PowerShell VersionInfo 输出典型形态：版本号 + CRLF
+  assert.strictEqual(
+    cc.installedCCVersion('C:\\Program Files\\cc-switch\\cc-switch.exe', { run: () => '3.16.2.0\r\n' }),
+    '3.16.2',
+    '四段式 PE 版本截取前三段'
+  )
+  // 混合文本（标签行 + 版本行）仍可解析
+  assert.strictEqual(
+    cc.installedCCVersion('/exe/cc-switch', { run: () => 'ProductVersion\r\n3.16.2.0' }),
+    '3.16.2'
+  )
+  assert.strictEqual(
+    cc.installedCCVersion('/exe/cc-switch', { run: () => '3.21.0-beta.1+x' }),
+    '3.21.0-beta.1',
+    '预发布段原样返回（+ 构建段截断），比较交给 versionAtLeast'
+  )
+  // plutil -raw 输出（darwin 语义，同正则解析）
+  assert.strictEqual(
+    cc.installedCCVersion('/Applications/CC Switch.app/Contents/MacOS/cc-switch', { run: () => '3.20.3\n' }),
+    '3.20.3'
+  )
+  // run 抛错（spawn error / 超时）→ ''
+  assert.strictEqual(cc.installedCCVersion('/exe/cc-switch', { run: () => { throw new Error('boom') } }), '')
+  // 输出为空 / 无版本段 → ''
+  assert.strictEqual(cc.installedCCVersion('/exe/cc-switch', { run: () => '' }), '')
+  assert.strictEqual(cc.installedCCVersion('/exe/cc-switch', { run: () => 'no version here' }), '')
+  // 空 exePath 直接返回空（且不触发 run）
+  let ran = false
+  assert.strictEqual(cc.installedCCVersion('', { run: () => { ran = true; return '3.20.3' } }), '')
+  assert.strictEqual(ran, false, '空 exePath 不应执行探测')
+})
+
+test('upgradeCC：落后版本 → 先停进程再覆盖安装 → 返回升级结果', async () => {
+  const calls = []
+  const r = await cc.upgradeCC({
+    home: '/tmp/x',
+    exePath: '/exe/cc-switch',
+    versionOf: () => '3.19.0',
+    fetchVersion: async () => '3.20.3',
+    stop: async ({ exePath }) => calls.push('stop:' + exePath),
+    install: async () => {
+      calls.push('install')
+      return { exePath: '/exe/new-cc-switch', version: '3.20.3', via: 'https://mirror/x' }
+    },
+  })
+  assert.deepStrictEqual(calls, ['stop:/exe/cc-switch', 'install'], '覆盖安装前必须先停止旧进程（Windows 文件锁 + SQLite 写锁）')
+  assert.strictEqual(r.checked, true)
+  assert.strictEqual(r.upgraded, true)
+  assert.strictEqual(r.exePath, '/exe/new-cc-switch')
+  assert.strictEqual(r.from, '3.19.0')
+  assert.strictEqual(r.to, '3.20.3')
+  assert.ok(/v3\.19\.0 → v3\.20\.3/.test(r.note), 'note 应含版本跨度: ' + r.note)
+})
+
+test('upgradeCC：已是最新 / 回滚场景更高版本 / 探测失败 / 拉取失败 → 跳过且不停进程', async () => {
+  const calls = []
+  const stop = async () => calls.push('stop')
+  const install = async () => calls.push('install')
+  // 已是最新
+  let r = await cc.upgradeCC({ home: '/x', exePath: '/exe', versionOf: () => '3.20.3', fetchVersion: async () => '3.20.3', stop, install })
+  assert.strictEqual(r.upgraded, false)
+  assert.ok(/已是最新/.test(r.note), 'note: ' + r.note)
+  // 当前版本比 latest 更高（如 latest 回退到 pinned 兜底）：不降级
+  r = await cc.upgradeCC({ home: '/x', exePath: '/exe', versionOf: () => '3.21.0', fetchVersion: async () => '3.20.3', stop, install })
+  assert.strictEqual(r.upgraded, false)
+  assert.ok(/已是最新/.test(r.note), '更高版本不应降级: ' + r.note)
+  // 探测不到当前版本
+  r = await cc.upgradeCC({ home: '/x', exePath: '/exe', versionOf: () => '', fetchVersion: async () => '3.20.3', stop, install })
+  assert.strictEqual(r.upgraded, false)
+  assert.ok(/跳过/.test(r.note), 'note: ' + r.note)
+  // 最新版本号拉取失败
+  r = await cc.upgradeCC({ home: '/x', exePath: '/exe', versionOf: () => '3.19.0', fetchVersion: async () => '', stop, install })
+  assert.strictEqual(r.upgraded, false)
+  assert.ok(/跳过/.test(r.note), 'note: ' + r.note)
+  assert.deepStrictEqual(calls, [], '以上场景都不应停止进程或触发安装')
+})
+
+test('upgradeCC：停止失败中止升级 / 安装失败降级继续（均不抛错）', async () => {
+  // 停止失败 → 升级中止，绝不覆盖安装
+  let r = await cc.upgradeCC({
+    home: '/x', exePath: '/exe',
+    versionOf: () => '3.19.0', fetchVersion: async () => '3.20.3',
+    stop: async () => { throw new Error('进程无法结束') },
+    install: async () => { throw new Error('不应触发安装') },
+  })
+  assert.strictEqual(r.upgraded, false)
+  assert.ok(/中止/.test(r.note) && /进程无法结束/.test(r.note), 'note: ' + r.note)
+  // 安装失败 → 降级继续用旧版本
+  r = await cc.upgradeCC({
+    home: '/x', exePath: '/exe',
+    versionOf: () => '3.19.0', fetchVersion: async () => '3.20.3',
+    stop: async () => {},
+    install: async () => { throw new Error('所有下载线路均失败') },
+  })
+  assert.strictEqual(r.upgraded, false)
+  assert.strictEqual(r.current, '3.19.0')
+  assert.ok(/升级失败/.test(r.note) && /所有下载线路均失败/.test(r.note), 'note: ' + r.note)
+})
+
+test('upgradeCC：缺 exePath 直接跳过 / onStage 播报升级开始', async () => {
+  const r = await cc.upgradeCC({ home: '/x', versionOf: () => '3.19.0', fetchVersion: async () => '3.20.3' })
+  assert.strictEqual(r.checked, false)
+  assert.strictEqual(r.upgraded, false)
+
+  const stages = []
+  await cc.upgradeCC({
+    home: '/x', exePath: '/exe',
+    versionOf: () => '3.19.0', fetchVersion: async () => '3.20.3',
+    stop: async () => {},
+    install: async () => ({ exePath: '/n', version: '3.20.3', via: '' }),
+    onStage: (m) => stages.push(m),
+  })
+  assert.ok(stages.some((s) => /v3\.19\.0 → v3\.20\.3/.test(s)), '应播报版本跨度: ' + JSON.stringify(stages))
 })

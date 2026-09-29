@@ -3,7 +3,7 @@
 
 const test = require('node:test')
 const assert = require('node:assert')
-const { buildTOML, hasProviderBlock, lineDiff } = require('../src/engine/toml')
+const { buildTOML, hasProviderBlock, lineDiff, setTopKey } = require('../src/engine/toml')
 
 const USER_TOML = `# 用户注释
 custom_flag = true
@@ -57,4 +57,21 @@ test('lineDiff 增删行', () => {
   const joined = d.join('\n')
   assert.ok(joined.includes('- b = 2'))
   assert.ok(joined.includes('+ c = 3'))
+})
+
+test('setTopKey 重复键收口为唯一一行（默认思考量失控防御）', () => {
+  // 历史现场：medium 在前、max 在后，TOML 后键静默覆盖前键，UI 显示失控
+  const dirty = 'model_reasoning_effort = "medium"\nmodel = "glm-5.3-flash"\n\n[model_providers.x]\nname = "x"\n\nmodel_reasoning_effort="max"\n'
+  const out = setTopKey(dirty.split('\n'), 'model_reasoning_effort', '"xhigh"').join('\n')
+  const n = (out.match(/^model_reasoning_effort\s*=/gm) || []).length
+  assert.strictEqual(n, 1, '重复键应只保留 1 个，实际 ' + n + ' 个\n' + out)
+  assert.ok(out.includes('model_reasoning_effort = "xhigh"'), '应写入 xhigh\n' + out)
+  assert.ok(!out.includes('"max"') || out.indexOf('model_reasoning_effort="max"') === -1, '旧 max 键应被删除')
+  assert.ok(out.includes('model = "glm-5.3-flash"'), '无关行不受影响')
+})
+
+test('setTopKey 无该键时前置插入', () => {
+  const out = setTopKey(['# 注释', '', 'a = 1'].join('\n').split('\n'), 'flag', 'true').join('\n')
+  const lines = out.split('\n')
+  assert.strictEqual(lines[2], 'flag = true', '应插在注释与空行之后、首个实体行之前\n' + out)
 })

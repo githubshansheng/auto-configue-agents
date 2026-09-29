@@ -46,6 +46,23 @@ if (!gotLock) {
   app.whenReady().then(async () => {
     const home = app.getPath('home')
     const distDir = path.join(__dirname, 'renderer')
+    // 启动防护：前端产物缺失（未执行 web 构建）时给出明确提示，而非静默白屏。
+    const fs = require('node:fs')
+    if (!fs.existsSync(path.join(distDir, 'index.html'))) {
+      const msg =
+        '前端资源缺失：' + distDir + ' 下没有 index.html。\n' +
+        '请先在 web/ 目录执行 npm install && npm run build 构建前端，再重新打包。'
+      if (SMOKE) {
+        // 无头自测模式：不弹窗，直接报错退出（退出码 1 便于脚本判定）
+        console.error('SMOKE-FAIL ' + msg)
+        app.exit(1)
+        return
+      }
+      const { dialog } = require('electron')
+      dialog.showErrorBox('tiancaiConfig 启动失败', msg)
+      app.quit()
+      return
+    }
     let started
     try {
       started = await startServer({ distDir, home })

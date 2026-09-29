@@ -7,20 +7,21 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NODE="${NODE:-node}"
 NPM="${NPM:-npm}"
 export ELECTRON_MIRROR="${ELECTRON_MIRROR:-https://npmmirror.com/mirrors/electron/}"
+export ELECTRON_BUILDER_BINARIES_MIRROR="${ELECTRON_BUILDER_BINARIES_MIRROR:-https://npmmirror.com/mirrors/electron-builder-binaries/}"
 
-echo "=== [1/4] 前端构建 (React + Vite) ==="
+echo "=== [1/4] 前端构建 (React + Vite，产物直出 app/renderer) ==="
 (cd "$ROOT/web" && "$NPM" run build)
-rm -rf "$ROOT/app/renderer"
-cp -R "$ROOT/web/dist" "$ROOT/app/renderer"
 
 echo "=== [2/4] 引擎测试 (node --test) ==="
 (cd "$ROOT/app" && "$NODE" --test)
 
 echo "=== [3/4] 冒烟自测（无头，不创建窗口） ==="
+# 注意：node -e 内必须用相对路径（cd app 后 ./src/server）。Git Bash 的 $ROOT 是
+# /l/... POSIX 形式，Windows 原生 node 无法解析，绝对路径内插会 MODULE_NOT_FOUND。
 (cd "$ROOT/app" && "$NODE" -e "
-const { startServer } = require('$ROOT/app/src/server')
+const { startServer } = require('./src/server')
 ;(async () => {
-  const { port, token, server } = await startServer({ distDir: '$ROOT/app/renderer', home: '/tmp' })
+  const { port, token, server } = await startServer({ distDir: './renderer', home: require('os').tmpdir() })
   const h = await fetch('http://127.0.0.1:' + port + '/api/health?t=' + token)
   if (h.status !== 200) throw new Error('health ' + h.status)
   console.log('smoke ok')
@@ -28,8 +29,11 @@ const { startServer } = require('$ROOT/app/src/server')
   process.exit(0)
 })()")
 
-echo "=== [4/4] Electron 打包 (mac zip + win portable) ==="
-(cd "$ROOT/app" && npx electron-builder --mac --win)
+echo "=== [4/4] Electron 打包（平台感知：macOS 出 zip 双架构 / Windows 出 portable exe） ==="
+case "$(uname -s)" in
+  Darwin*) (cd "$ROOT/app" && npx electron-builder --mac) ;;
+  *)       (cd "$ROOT/app" && npx electron-builder --win) ;;
+esac
 
 echo "=== 产物 ==="
 ls -lh "$ROOT/dist-electron"
