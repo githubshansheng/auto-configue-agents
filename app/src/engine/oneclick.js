@@ -221,7 +221,8 @@ async function run({ home, request, emit, signal, persistEnv, ccswitchApi, autou
 
   // 5. 生成写入计划（干跑，不落盘；Codex 与 WorkBuddy 使用各自的 baseUrl/默认模型）
   stage('plan', 'running', '')
-  const cfgOf = (t) => (t.id === 'workbuddy' ? cfgWB : cfgCodex)
+  // hermes 与 WorkBuddy 同面：直连中转站 + 全量勾选模型 + 同一默认模型
+  const cfgOf = (t) => (t.id === 'workbuddy' || t.id === 'hermes' ? cfgWB : cfgCodex)
   const allChanges = []
   for (const t of targets) {
     try {

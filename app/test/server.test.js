@@ -36,7 +36,7 @@ test('服务令牌校验 + targets + SPA 回退', async (t) => {
   const targets = await get(base + '/api/targets?t=' + token)
   assert.strictEqual(targets.status, 200)
   const parsed = JSON.parse(targets.text)
-  assert.deepStrictEqual(parsed.targets.map((x) => x.id), ['codexcli', 'codexdesktop', 'workbuddy'])
+  assert.deepStrictEqual(parsed.targets.map((x) => x.id), ['codexcli', 'codexdesktop', 'workbuddy', 'hermes'])
 
   // 未知路径回退 index.html
   const spa = await get(base + '/whatever?t=' + token)

@@ -4,6 +4,7 @@
 const codexconfig = require('./codexconfig')
 const backup = require('./backup')
 const workbuddy = require('./workbuddy')
+const hermes = require('./hermes')
 
 function makeCodexTarget(id, displayName, desktop) {
   return {
@@ -65,8 +66,35 @@ const workbuddyTarget = {
   },
 }
 
+const hermesTarget = {
+  id: 'hermes',
+  displayName: 'Hermes',
+  // 未适配模型自动更新：不设 autoupdate 字段，UI 不渲染开关（未来适配后补）
+  detect(home) {
+    const dr = hermes.detect(home)
+    dr.id = 'hermes'
+    dr.displayName = 'Hermes'
+    return dr
+  },
+  plan(home, cfg) {
+    return hermes.plan(home, cfg)
+  },
+  backup(home) {
+    return hermes.backup(home)
+  },
+  configure(home, cfg) {
+    return hermes.configure(home, cfg)
+  },
+  verify(home, cfg) {
+    return hermes.verify(home, cfg)
+  },
+  rollback(receipt) {
+    return hermes.rollback(receipt)
+  },
+}
+
 function all() {
-  return [makeCodexTarget('codexcli', 'Codex CLI', false), makeCodexTarget('codexdesktop', 'Codex Desktop', true), workbuddyTarget]
+  return [makeCodexTarget('codexcli', 'Codex CLI', false), makeCodexTarget('codexdesktop', 'Codex Desktop', true), workbuddyTarget, hermesTarget]
 }
 
 function byID(id) {
