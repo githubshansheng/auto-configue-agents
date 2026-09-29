@@ -1,4 +1,8 @@
 // Hermes Agent 目标：~/.hermes/config.yaml 原位编辑（model: 段四字段）。
+// 设计约定（2026-09-29 用户定规）：hermes 是 chat/completions 兼容客户端，
+// 直连第三方 API（中转站 base_url + api_key 直写 config）——绝不指向
+// cc-switch 本地路由（127.0.0.1:15721），也不依赖 cc-switch 模型目录；
+// 一键配置流程中 cc-switch 阶段仅由 Codex 目标触发（oneclick.codexSelected）。
 // 直连中转站（OpenAI 兼容）：provider="custom" + base_url + api_key + default 模型。
 // 关键约束：config.yaml 是 hermes 的完整主配置（500+ 行注释 + 用户自定义段），
 // 绝不能整文件重写——只做行级原位替换，注释与其他段一字不动。

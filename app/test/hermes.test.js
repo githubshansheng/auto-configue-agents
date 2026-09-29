@@ -149,6 +149,16 @@ test('config 无顶层 model: 段 → configure 拒绝盲写', () => {
   assert.throws(() => hermes.configure(home, CFG), /model: 段|结构异常/)
 })
 
+test('设计约定：hermes 直连第三方 api，绝不指向 cc-switch 本地路由', () => {
+  const home = mkHome()
+  writeFixture(home)
+  hermes.configure(home, CFG)
+  const out = fs.readFileSync(hermes.configPath(home), 'utf8')
+  assert.ok(!out.includes('127.0.0.1:15721'), '不得引用 cc-switch 本地路由端口')
+  assert.ok(out.includes('base_url: "https://ai.heigh.vip/v1"'), '必须直连中转站')
+  assert.strictEqual(hermes.normalizeBase('https://x.example'), 'https://x.example/v1', 'normalizeBase 恒拼 /v1（chat/completions 端点）')
+})
+
 test('registry 集成：hermes 目标可发现且 detect 返回 id', () => {
   const t = registry.byID('hermes')
   assert.ok(t, 'byID 应命中 hermes')
