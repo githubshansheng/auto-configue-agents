@@ -75,6 +75,8 @@ test('autoupdateOnce：拉取+过滤+合并幂等；白名单与手工条目处�
   const list2 = wb.loadEntries(wb.modelsPath(home))
   assert.strictEqual(list2.length, list.length, '幂等：条目数不变')
   const perms = fs.statSync(wb.modelsPath(home)).mode & 0o777
+  // chmod 600 是 POSIX 语义；Windows 的 fs.chmod 只切只读位、mode 恒为 0o666，非 POSIX 平台跳过
+  if (process.platform === 'win32') return
   assert.strictEqual(perms, 0o600, '包含 Key 的文件应 chmod 600')
 })
 

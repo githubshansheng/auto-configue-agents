@@ -130,6 +130,29 @@ function detectCC(home, opts = {}) {
 
 // ---------- 版本与下载 ----------
 
+// parseVersion 从版本字符串提取数值段：'v3.20.3' / '3.21.0-beta.1' / 'cc-switch 3.20.3 (abc)'
+// → [3,20,3]；无数字段返回 null。预发布/构建后缀截断忽略（只比较主版本号）。
+function parseVersion(v) {
+  const m = String(v || '').match(/\d+(?:\.\d+)*/)
+  if (!m) return null
+  return m[0].split('.').map(Number)
+}
+
+// versionAtLeast 语义化比较 v >= min：逐段数值比较（不做字符串比较，3.9 < 3.10），
+// 缺段按 0 补齐（3.20 == 3.20.0）；任一侧解析失败返回 false（保守判定为需升级前置检查不通过）。
+function versionAtLeast(v, min) {
+  const a = parseVersion(v)
+  const b = parseVersion(min)
+  if (!a || !b) return false
+  const n = Math.max(a.length, b.length)
+  for (let i = 0; i < n; i++) {
+    const x = a[i] || 0
+    const y = b[i] || 0
+    if (x !== y) return x > y
+  }
+  return true
+}
+
 async function fetchLatestVersion() {
   try {
     const ctl = new AbortController()
@@ -146,6 +169,89 @@ async function fetchLatestVersion() {
     }
   } catch {}
   return PINNED_VERSION
+}
+
+// installedCCVersion 读取已安装 cc-switch 的版本号：读可执行文件的版本资源
+// （win: PowerShell Get-Item …VersionInfo.ProductVersion，空则回退 FileVersion；
+//  mac: plutil 读 .app/Contents/Info.plist 的 CFBundleShortVersionString），
+// 从输出解析首个 x.y.z（兼容预发布后缀）；探测失败返回 ''（调用方跳过升级检查）。
+// 背景：cc-switch 为 Tauri GUI 应用，--version / -V 零输出且无副作用（2026-09-29 真机证伪），
+// 必须读文件版本信息而非运行程序。opts.run 可注入测试桩：run(exePath) → 原始输出文本。
+function installedCCVersion(exePath, opts = {}) {
+  if (!exePath) return ''
+  const run =
+    opts.run ||
+    ((f) => {
+      if (process.platform === 'win32') {
+        const esc = String(f).replace(/'/g, "''")
+        const psProp = (prop) => {
+          const r = spawnSync('powershell', ['-NoProfile', '-Command',
+            "(Get-Item -LiteralPath '" + esc + "').VersionInfo." + prop], { encoding: 'utf8', timeout: 15000, windowsHide: true })
+          return String(r.stdout || '').trim()
+        }
+        return psProp('ProductVersion') || psProp('FileVersion')
+      }
+      if (process.platform === 'darwin') {
+        const r = spawnSync('/usr/bin/plutil', ['-extract', 'CFBundleShortVersionString', 'raw',
+          path.join(macAppBundle(exePath), 'Contents', 'Info.plist')], { encoding: 'utf8', timeout: 10000 })
+        return String(r.stdout || '')
+      }
+      return ''
+    })
+  try {
+    const m = String(run(exePath) || '').match(/\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?/)
+    if (m) return m[0]
+  } catch {}
+  return ''
+}
+
+// upgradeCC 版本检查与自动升级路径（ensureReady 对已安装实例调用）：
+//   探测当前版本 → 拉取最新版本（GitHub 不可达时回退 PINNED_VERSION）→ 比较 →
+//   落后则停止进程（覆盖安装期间不能有活进程：Windows 文件锁 + SQLite 写锁）→ installCC 覆盖安装。
+// 全链路非致命：探测失败 / 版本号拉取失败 / 停止失败 / 下载安装失败 均不抛错，
+// 返回 { upgraded: false, note } 由调用方降级继续用旧版本；只有「确定落后且安装成功」
+// 才返回 { upgraded: true, exePath, from, to }。versionOf/fetchVersion/install/stop 均可注入测试桩。
+async function upgradeCC({ home, exePath, onStage, versionOf = installedCCVersion, fetchVersion = fetchLatestVersion, install = installCC, stop = stopCC } = {}) {
+  if (!exePath) return { checked: false, upgraded: false, note: '缺少可执行文件，跳过版本检查' }
+  let current = ''
+  try {
+    current = versionOf(exePath) || ''
+  } catch {}
+  let latest = ''
+  try {
+    latest = String((await fetchVersion()) || '')
+  } catch {}
+  if (!/^\d+\.\d+\.\d+$/.test(latest)) {
+    return { checked: false, upgraded: false, current, note: '无法获取 cc-switch 最新版本号，跳过升级检查' }
+  }
+  if (!current) {
+    return { checked: true, upgraded: false, latest, note: '无法读取 cc-switch 当前版本（文件版本信息不可用），跳过升级' }
+  }
+  if (versionAtLeast(current, latest)) {
+    return { checked: true, upgraded: false, current, latest, note: 'cc-switch 已是最新版本（v' + current + '）' }
+  }
+  if (onStage) onStage('发现 cc-switch 新版本：v' + current + ' → v' + latest + '，正在自动升级…')
+  try {
+    await stop({ exePath })
+  } catch (e) {
+    return { checked: true, upgraded: false, current, latest, note: '升级中止（旧进程无法结束）：' + e.message }
+  }
+  try {
+    const inst = await install({ home, onStage })
+    const to = inst.version || latest
+    return {
+      checked: true,
+      upgraded: true,
+      exePath: inst.exePath,
+      from: current,
+      to,
+      latest,
+      via: inst.via || '',
+      note: 'cc-switch 已升级：v' + current + ' → v' + to,
+    }
+  } catch (e) {
+    return { checked: true, upgraded: false, current, latest, note: '自动升级失败（继续使用 v' + current + '）：' + e.message }
+  }
 }
 
 // ghCandidates 国内镜像优先（沿用旧工具线路：ghproxy 系存活探测略，逐条尝试即可）。
@@ -698,8 +804,9 @@ function schemaReady(dbPath) {
   }
 }
 
-// ensureReady 保证 cc-switch 就绪可写库，返回 { exePath, installed, initialized }：
-//   1) 定位可执行文件，缺则自动下载安装（沿用旧工具 install.go 链路）
+// ensureReady 保证 cc-switch 就绪可写库，返回 { exePath, installed, initialized, upgraded, from, to, upgradeNote }：
+//   1) 定位可执行文件，缺则自动下载安装（沿用旧工具 install.go 链路）；
+//      已安装则做版本检查，落后即自动升级（upgradeCC，失败降级继续用旧版本）
 //   2) 数据库不存在或表结构不完整 → 先启动 cc-switch 等待完整初始化
 //      （providers/proxy_config 两表 + settings.json 生成，沿用原版 step2/step3 语义），再停止进程让出写锁
 //   3) 数据库完整 → 停止进程（busy_timeout 兜底并发写）
@@ -707,10 +814,15 @@ async function ensureReady({ home, onStage } = {}) {
   const det = detectCC(home)
   let exePath = det.exePath
   const installed = !exePath
+  let upgrade = { checked: false, upgraded: false, note: '' }
   if (!exePath) {
     if (onStage) onStage(det.dbInstalled ? '正在补装 cc-switch…' : '正在下载安装 cc-switch…')
     const inst = await installCC({ home, onStage })
     exePath = inst.exePath
+  } else {
+    // 已安装：版本检查，落后即自动升级（失败降级继续用旧版本，不阻断配置主流程）
+    upgrade = await upgradeCC({ home, exePath, onStage })
+    if (upgrade.upgraded && upgrade.exePath) exePath = upgrade.exePath
   }
   const fullyReady = () => fileExists(ccDBPath(home)) && schemaReady(ccDBPath(home))
   const waitReady = async (deadlineMs, onTick) => {
@@ -744,7 +856,15 @@ async function ensureReady({ home, onStage } = {}) {
     await stopCC({ exePath })
     await sleep(500)
   }
-  return { exePath, installed, initialized }
+  return {
+    exePath,
+    installed,
+    initialized,
+    upgraded: !!upgrade.upgraded,
+    from: upgrade.from,
+    to: upgrade.to,
+    upgradeNote: upgrade.note || '',
+  }
 }
 
 // launchAndEnsureCurrent 启动 cc-switch 并确保 UI「当前供应商」指向本次写入的配置。
@@ -781,11 +901,58 @@ async function launchAndEnsureCurrent(exePath, { home, pid, launchFn, stopFn, ve
   throw new Error('cc-switch 启动后当前供应商未能指向新增配置（currentProviderCodex=' + (last || '(空)') + '），请打开 cc-switch 手动切换')
 }
 
+// ── Codex 模型目录同步（cc-switch-model-catalog.json）────────────────
+// Codex Desktop 读取 ~/.codex/config.toml 中 model_catalog_json 指向的目录文件
+// 渲染模型思考档位。cc-switch 本体投影的模板默认 medium 且只有四档（缺 max），
+// 与「默认 xhigh、所有模型可选到 max」的产品要求不符，这里幂等收口：
+//   · supported_reasoning_levels 统一五档 low/medium/high/xhigh/max
+//   · default_reasoning_level = xhigh（全模型）
+// 文件不存在时跳过（未建立该机制的机器不引入新文件）。
+const CODEX_CATALOG_LEVELS = [
+  { description: 'Fast responses with lighter reasoning', effort: 'low' },
+  { description: 'Balances speed and reasoning depth for everyday tasks', effort: 'medium' },
+  { description: 'Greater reasoning depth for complex problems', effort: 'high' },
+  { description: 'Extra high reasoning depth for complex problems', effort: 'xhigh' },
+  { description: 'Maximum reasoning depth for the hardest problems', effort: 'max' },
+]
+
+function codexCatalogPath(home) {
+  return path.join(home, '.codex', 'cc-switch-model-catalog.json')
+}
+
+function syncCodexModelCatalog(home) {
+  const p = codexCatalogPath(home)
+  let raw
+  try {
+    raw = fs.readFileSync(p, 'utf8')
+  } catch (e) {
+    if (e.code === 'ENOENT') return '跳过：未找到模型目录文件（本机未启用 model_catalog_json 机制）'
+    throw e
+  }
+  const cat = JSON.parse(raw)
+  const models = Array.isArray(cat.models) ? cat.models : []
+  let changed = 0
+  for (const m of models) {
+    if (!m || typeof m !== 'object') continue
+    const before = JSON.stringify([m.supported_reasoning_levels, m.default_reasoning_level])
+    m.supported_reasoning_levels = CODEX_CATALOG_LEVELS.map((l) => ({ ...l }))
+    m.default_reasoning_level = DEFAULT_REASONING
+    if (JSON.stringify([m.supported_reasoning_levels, m.default_reasoning_level]) !== before) changed++
+  }
+  if (!changed) return '模型目录已符合要求（' + models.length + ' 个模型，默认 xhigh，档位支持至 max）'
+  const tmp = p + '.tmp'
+  fs.writeFileSync(tmp, JSON.stringify(cat, null, 2))
+  fs.renameSync(tmp, p)
+  return '已统一模型目录：' + models.length + ' 个模型默认思考量 xhigh、档位支持至 max（修正 ' + changed + ' 个）'
+}
+
 module.exports = {
   CC_PORT, CC_REPO, PINNED_VERSION, PROVIDER_NAME, LEGACY_PROVIDER_NAMES, REASONING_LEVELS, DEFAULT_REASONING, DEFAULT_CONTEXT_WINDOW,
   ccDir, ccDBPath, ccSettingsPath, detectCC, locateExe, fetchLatestVersion, installCC,
+  parseVersion, versionAtLeast, installedCCVersion, upgradeCC,
   MAC_PS_PATTERN, macQuitAppNames, ccPids, ccRunning, stopCC, launchCC,
   buildProviderToml, configureProvider, setAutostart, autostartEnabled,
   insertRowAdaptive, tableColumns, ensureReady, schemaReady,
   readCurrentProvider, writeCurrentProvider, launchAndEnsureCurrent,
+  codexCatalogPath, syncCodexModelCatalog,
 }

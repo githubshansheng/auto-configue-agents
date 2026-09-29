@@ -22,20 +22,27 @@ function splitLines(s) {
 
 function setTopKey(lines, key, value) {
   const re = new RegExp('^\\s*' + escapeRe(key) + '\\s*=')
-  for (let i = 0; i < lines.length; i++) {
-    if (re.test(lines[i])) {
-      const out = lines.slice()
-      out[i] = key + ' = ' + value
-      return out
+  const out = []
+  let replaced = false
+  for (const l of lines) {
+    if (re.test(l)) {
+      if (!replaced) {
+        out.push(key + ' = ' + value) // 首个匹配：原位替换
+        replaced = true
+      }
+      // 后续同名重复键直接丢弃（TOML 重复顶层键语义未定义，后键静默覆盖前键，
+      // 历史上出现过 medium/max 并存导致默认思考量失控，必须收口为唯一一行）
+      continue
     }
+    out.push(l)
   }
+  if (replaced) return out
   let insert = 0
-  while (insert < lines.length) {
-    const t = lines[insert].trim()
+  while (insert < out.length) {
+    const t = out[insert].trim()
     if (t === '' || t.startsWith('#')) insert++
     else break
   }
-  const out = lines.slice()
   out.splice(insert, 0, key + ' = ' + value)
   return out
 }

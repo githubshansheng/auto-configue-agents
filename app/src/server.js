@@ -227,9 +227,20 @@ function createHandler({ distDir, home }) {
       if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) {
         file = path.join(distAbs, 'index.html') // SPA 回退
       }
+      // 启动防护：前端产物缺失（未执行 web 构建）时优雅降级为 503 + 明确文本，避免 ENOENT 静默白屏
+      if (!fs.existsSync(file)) {
+        res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8' })
+        res.end('前端资源缺失：' + distAbs + ' 下没有 index.html，请先在 web/ 目录执行 npm install && npm run build 后重新打包')
+        return
+      }
       const ext = path.extname(file).toLowerCase()
       res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' })
-      fs.createReadStream(file).pipe(res)
+      // 流式读盘：挂 error 监听，避免读盘失败（如文件在检查后被删）变成未处理异常打崩进程
+      const stream = fs.createReadStream(file)
+      stream.on('error', () => {
+        if (!res.destroyed) res.end()
+      })
+      stream.pipe(res)
     } catch (e) {
       try {
         res.writeHead(500)
