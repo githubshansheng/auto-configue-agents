@@ -490,6 +490,8 @@ test('勾选范围 checkedModels：模型池收窄至勾选项；空交集回退
   assert.strictEqual(cp[1].defaultModel, 'z-slow')
   const fe = stageEnd(events, 'filter')
   assert.ok(fe.detail.includes('按勾选范围保留 1 个'), 'filter detail: ' + fe.detail)
+  // 勾选范围外的站点模型须在明细中可见（站点后上架模型不应被静默丢弃）
+  assert.ok(fe.detail.includes('勾选范围外剔除 2 个：a-fast, gpt-5.6-test'), 'filter detail 应含剔除明细: ' + fe.detail)
   assert.strictEqual(fe.status, 'ok')
   // WorkBuddy 未选，不应有写入
   assert.ok(!fs.existsSync(path.join(home, '.workbuddy')), '未勾选 WorkBuddy 不应写入')
@@ -514,4 +516,32 @@ test('勾选范围 checkedModels：模型池收窄至勾选项；空交集回退
   assert.ok(fe2.detail.includes('无交集'), 'filter detail: ' + fe2.detail)
   const cp2 = ccCalls2.find((c) => Array.isArray(c) && c[0] === 'configureProvider')
   assert.strictEqual(cp2[1].models.length, 3, '空交集应回退全量对话模型（3 个）')
+})
+
+// 写入配置必须用过滤后全量模型（keptAll），不得被测速探针子集（MAX_PROBE=12）截断——
+// 否则站点模型超过 12 个时 models.json 静默丢失尾部模型（含站点后上架的新模型）
+test('WorkBuddy 写入全量模型：站点模型超过 MAX_PROBE 时 models.json 不截断', async (t) => {
+  const extras = Array.from({ length: 12 }, (_, i) => 'x-model-' + (i + 1))
+  const { srv, url } = await relay(t, { 'a-fast': 30 }, extras)
+  t.after(() => srv.close())
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'triconfig-fullwb-'))
+  const events = []
+  await run({
+    home,
+    request: { baseUrl: url, apiKey: 'sk-ok', targets: ['workbuddy'] },
+    emit: (e) => events.push(e),
+    persistEnv: async () => 'stub',
+    ccswitchApi: stubCC([]),
+    autoupdateApi: stubAU([]),
+  })
+  const done = last(events, 'done')
+  assert.ok(done && done.ok, '管线应成功: ' + JSON.stringify(done))
+  const arr = JSON.parse(fs.readFileSync(path.join(home, '.workbuddy', 'models.json'), 'utf8'))
+  const ids = arr.map((m) => m.id)
+  // 对话模型全量 15 个 = 3 内置（a-fast/z-slow/gpt-5.6-test）+ 12 追加；测速探针仅前 12 个
+  assert.strictEqual(ids.length, 15, 'models.json 应含全部 15 个对话模型，实际 ' + ids.length)
+  for (const tail of ['x-model-10', 'x-model-11', 'x-model-12']) {
+    assert.ok(ids.includes(tail), '排在 MAX_PROBE 之后的 ' + tail + ' 不应被截断')
+  }
 })

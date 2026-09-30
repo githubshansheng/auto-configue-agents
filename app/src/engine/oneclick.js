@@ -125,6 +125,11 @@ async function run({ home, request, emit, signal, persistEnv, ccswitchApi, autou
     if (scoped.length) {
       keptAll = scoped
       filterDetail += '；按勾选范围保留 ' + scoped.length + ' 个'
+      // 勾选集合可能落后于站点现状（GUI 长开、站点后上架模型），把被剔除项写进明细，避免静默丢失
+      const dropped = keptRaw.filter((id) => !inSet.has(id))
+      if (dropped.length) {
+        filterDetail += '；勾选范围外剔除 ' + dropped.length + ' 个：' + dropped.slice(0, 5).join(', ') + (dropped.length > 5 ? ' 等' : '')
+      }
     } else {
       scopeMissed = true
       filterDetail += '；勾选范围与站点模型无交集，已回退全量'
@@ -181,8 +186,12 @@ async function run({ home, request, emit, signal, persistEnv, ccswitchApi, autou
   const defaultMissed = wbPick.fallback || codexPick.fallback
   stage('speedtest', allFailed || defaultMissed ? 'warn' : 'ok', speedDetail + (allFailed ? '（写入仍会进行，请检查网络）' : ''))
 
-  const cfgWB = { baseUrl: base, apiKey: request.apiKey, defaultModel: wbPick.id, models: ms }
-  let cfgCodex = { baseUrl: base, apiKey: request.apiKey, defaultModel: codexPick.id, models: ms }
+  // 写入配置用全量对话模型（keptAll），而非测速探针子集（ms 仅前 MAX_PROBE 个）——
+  // 否则站点模型超过 MAX_PROBE 时下游 models.json 会被截断，新增模型静默丢失。
+  // workbuddy.js 合并逻辑按 m.id 取值，故映射为对象而非裸字符串。
+  const allModelObjs = keptAll.map((id) => ({ id }))
+  const cfgWB = { baseUrl: base, apiKey: request.apiKey, defaultModel: wbPick.id, models: allModelObjs }
+  let cfgCodex = { baseUrl: base, apiKey: request.apiKey, defaultModel: codexPick.id, models: allModelObjs }
 
   // 4.5 cc-switch 本地路由（all-models 且勾选了 Codex 目标时）
   let ccExe = ''
@@ -207,7 +216,7 @@ async function run({ home, request, emit, signal, persistEnv, ccswitchApi, autou
       let autoMsg = ''
       if (proxyAutostart && ccExe) autoMsg = cc.setAutostart(home, { exePath: ccExe, enabled: true })
       didCC = true
-      cfgCodex = { baseUrl: CC_PROXY_BASE, apiKey: request.apiKey, defaultModel: codexPick.id, models: ms }
+      cfgCodex = { baseUrl: CC_PROXY_BASE, apiKey: request.apiKey, defaultModel: codexPick.id, models: allModelObjs }
       stage(
         'ccswitch',
         'ok',

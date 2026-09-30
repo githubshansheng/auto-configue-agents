@@ -909,6 +909,9 @@ async function launchAndEnsureCurrent(exePath, { home, pid, launchFn, stopFn, ve
 // 与「默认 xhigh、所有模型可选到 max」的产品要求不符，这里幂等收口：
 //   · supported_reasoning_levels 统一五档 low/medium/high/xhigh/max
 //   · default_reasoning_level = xhigh（全模型）
+//   · context_window / max_context_window：cc-switch 对不在已知名单中的模型投影
+//     128000 兜底或缺失字段，统一改为 DEFAULT_CONTEXT_WINDOW（272000）；
+//     其他真实取值（如 400000）一律不动。
 // 文件不存在时跳过（未建立该机制的机器不引入新文件）。
 const CODEX_CATALOG_LEVELS = [
   { description: 'Fast responses with lighter reasoning', effort: 'low' },
@@ -934,22 +937,28 @@ function syncCodexModelCatalog(home) {
   const cat = JSON.parse(raw)
   const models = Array.isArray(cat.models) ? cat.models : []
   let changed = 0
+  let cwFixed = 0
   for (const m of models) {
     if (!m || typeof m !== 'object') continue
+    let cwChanged = 0
+    // 128000 是 cc-switch 对未知模型的投影默认（「不在已知名单」信号）；缺失/非数值/<=0（手工编辑或损坏数据）同样兜底
+    if (!Number.isFinite(m.context_window) || m.context_window <= 0 || m.context_window === 128000) { m.context_window = DEFAULT_CONTEXT_WINDOW; cwChanged++ }
+    if (!Number.isFinite(m.max_context_window) || m.max_context_window <= 0 || m.max_context_window === 128000) { m.max_context_window = DEFAULT_CONTEXT_WINDOW; cwChanged++ }
+    if (cwChanged) cwFixed++
     const before = JSON.stringify([m.supported_reasoning_levels, m.default_reasoning_level])
     m.supported_reasoning_levels = CODEX_CATALOG_LEVELS.map((l) => ({ ...l }))
     m.default_reasoning_level = DEFAULT_REASONING
-    if (JSON.stringify([m.supported_reasoning_levels, m.default_reasoning_level]) !== before) changed++
+    if (JSON.stringify([m.supported_reasoning_levels, m.default_reasoning_level]) !== before || cwChanged) changed++
   }
-  if (!changed) return '模型目录已符合要求（' + models.length + ' 个模型，默认 xhigh，档位支持至 max）'
+  if (!changed) return '模型目录已符合要求（' + models.length + ' 个模型，默认 xhigh，档位支持至 max，上下文 ' + DEFAULT_CONTEXT_WINDOW + '）'
   const tmp = p + '.tmp'
   fs.writeFileSync(tmp, JSON.stringify(cat, null, 2))
   fs.renameSync(tmp, p)
-  return '已统一模型目录：' + models.length + ' 个模型默认思考量 xhigh、档位支持至 max（修正 ' + changed + ' 个）'
+  return '已统一模型目录：' + models.length + ' 个模型默认思考量 xhigh、档位支持至 max（修正 ' + changed + ' 个，上下文兜底修正 ' + cwFixed + ' 个）'
 }
 
 module.exports = {
-  CC_PORT, CC_REPO, PINNED_VERSION, PROVIDER_NAME, LEGACY_PROVIDER_NAMES, REASONING_LEVELS, DEFAULT_REASONING, DEFAULT_CONTEXT_WINDOW,
+  CC_PORT, CC_REPO, PINNED_VERSION, PROVIDER_NAME, LEGACY_PROVIDER_NAMES, REASONING_LEVELS, DEFAULT_REASONING, DEFAULT_CONTEXT_WINDOW, CODEX_CATALOG_LEVELS,
   ccDir, ccDBPath, ccSettingsPath, detectCC, locateExe, fetchLatestVersion, installCC,
   parseVersion, versionAtLeast, installedCCVersion, upgradeCC,
   MAC_PS_PATTERN, macQuitAppNames, ccPids, ccRunning, stopCC, launchCC,

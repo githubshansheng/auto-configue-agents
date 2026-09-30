@@ -83,13 +83,20 @@ export default function App() {
   const [defaultModel, setDefaultModel] = useState('')
   const [modelFallback, setModelFallback] = useState('glm-5.3-flash')
   // 模型清单（填写 Key 后自动拉取）：siteModels = 站点可对话模型 id；
-  // checkedIds = 勾选范围（拉取成功默认全选，取消勾选的模型不写入）；mStatus 三态。
+  // checkedIds = 勾选范围（首次拉取默认全选；再次拉取保留已知模型的勾选状态，
+  // 新出现的模型自动勾选，避免站点后上架模型被陈旧勾选集合静默丢弃）；mStatus 三态。
   const [siteModels, setSiteModels] = useState([])
   const [checkedIds, setCheckedIds] = useState(() => new Set())
   const [mStatus, setMStatus] = useState('idle') // idle | loading | ok | fail
   const [mError, setMError] = useState('')
   const modelsAbortRef = useRef(null)
   const lastFetchRef = useRef('')
+  // seenIdsRef：上次成功拉取的全量 id 集合（识别新增模型）；lastFetchAtRef：上次成功拉取时间（运行前保鲜）
+  const seenIdsRef = useRef(null)
+  const lastFetchAtRef = useRef(0)
+  // checkedIdsRef：勾选集合的最新值（运行前保鲜时同步读取，避免闭包陈旧）
+  const checkedIdsRef = useRef(checkedIds)
+  useEffect(() => { checkedIdsRef.current = checkedIds }, [checkedIds])
   // 模型自动更新（按目标注册）：已适配目标缺省即勾选（!== false），用户可逐项取消
   const [autoUpdate, setAutoUpdate] = useState({})
   // 运行日志窗口（查看详情右侧）：实时追加、自动滚底、上限 500 行
@@ -131,23 +138,34 @@ export default function App() {
   const runningRef = useRef(false)
   useEffect(() => { runningRef.current = running }, [running])
 
-  // 拉取站点模型清单（服务端过滤非对话模型）；成功后默认全选。
-  // 已持久化的默认模型不在新清单中时重置为未设置。
-  const fetchSiteModels = (key, url) => {
-    if (!key || !url) return
+  // 拉取站点模型清单内核（服务端过滤非对话模型）：返回 Promise<{ ok, ids, checked?, message? }>，
+  // 供防抖自动拉取与「运行前保鲜」复用。成功后：首次拉取全选；再次拉取保留已知模型的
+  // 勾选/取消状态，新出现的模型（不在 seenIdsRef 中）自动勾选。
+  const refreshModels = (key, url) => {
+    if (!key || !url) return Promise.resolve({ ok: false, ids: [], message: '缺少 API Key 或中转地址' })
     if (modelsAbortRef.current) modelsAbortRef.current.abort()
     const ctl = new AbortController()
     modelsAbortRef.current = ctl
     lastFetchRef.current = key + '@' + url
     setMStatus('loading'); setMError('')
-    api('/api/models', { method: 'POST', body: JSON.stringify({ baseUrl: url, apiKey: key }), signal: ctl.signal })
+    return api('/api/models', { method: 'POST', body: JSON.stringify({ baseUrl: url, apiKey: key }), signal: ctl.signal })
       .then((d) => {
         if (!d.ok) throw new Error(d.message || '拉取失败')
         const ids = d.models || []
+        const prevSeen = seenIdsRef.current
+        seenIdsRef.current = new Set(ids)
+        lastFetchAtRef.current = Date.now()
+        const prevChecked = checkedIdsRef.current
+        const nextChecked = new Set()
+        for (const id of ids) {
+          // 已知模型沿用用户的勾选/取消状态；新模型（无上次记录或不在上次清单中）自动勾选
+          if (prevChecked.has(id) || !prevSeen || !prevSeen.has(id)) nextChecked.add(id)
+        }
         setSiteModels(ids)
-        setCheckedIds(new Set(ids))
+        setCheckedIds(nextChecked)
         setMStatus('ok')
-        pushLog('info', '已拉取模型清单：' + ids.length + ' 个（默认全选，可取消勾选）')
+        const freshCount = prevSeen ? ids.filter((id) => !prevSeen.has(id)).length : 0
+        pushLog('info', '已拉取模型清单：' + ids.length + ' 个（默认全选，可取消勾选' + (freshCount > 0 ? '；新增 ' + freshCount + ' 个已自动勾选' : '') + '）')
         setDefaultModel((dm) => {
           if (dm && !ids.includes(dm)) {
             saveDefaultModel('')
@@ -155,14 +173,20 @@ export default function App() {
           }
           return dm
         })
+        return { ok: true, ids, checked: [...nextChecked] }
       })
       .catch((e) => {
-        if (e && e.name === 'AbortError') return
+        if (e && e.name === 'AbortError') return { ok: false, ids: [], message: '拉取已被中断' }
         setSiteModels([]); setCheckedIds(new Set())
         setMStatus('fail')
-        setMError(e && e.message ? e.message : '网络错误')
+        const msg = e && e.message ? e.message : '网络错误'
+        setMError(msg)
+        return { ok: false, ids: [], message: msg }
       })
   }
+
+  // 防抖自动拉取 / 手动刷新入口（沿用原签名）
+  const fetchSiteModels = (key, url) => { refreshModels(key, url) }
 
   // 填写/修改 API Key 或中转地址后 700ms 防抖自动拉取；清空 Key 即清空清单
   useEffect(() => {
@@ -244,13 +268,29 @@ export default function App() {
   }
 
   const runOneClick = async () => {
+    // 运行前保鲜：清单已成功拉取且距上次成功拉取超过 60 秒 → 先重新拉取一次，
+    // 让中转站新增模型进入勾选范围（避免陈旧勾选集合把新模型静默剔除在配置结果外）。
+    // 拉取失败不阻塞运行（fail-open）：沿用当前勾选快照继续提交。
+    const freshKey = apiKey.trim()
+    const freshUrl = baseUrl.trim()
+    let checkedModels = [...checkedIdsRef.current]
+    if (mStatus === 'ok' && freshKey && freshUrl && Date.now() - lastFetchAtRef.current > 60 * 1000) {
+      pushLog('info', '距上次拉取模型清单已超过 60 秒，运行前先刷新一次…')
+      const r = await refreshModels(freshKey, freshUrl)
+      if (r.ok) {
+        checkedModels = r.checked
+        pushLog('ok', '运行前刷新完成：' + r.ids.length + ' 个模型')
+      } else {
+        pushLog('warn', '运行前刷新模型清单失败（' + r.message + '），沿用当前勾选继续运行')
+      }
+    }
     setRunning(true); setStages({}); setModels([]); setChanges([]); setResults([]); setFinalMsg(null); setError(''); setLogs([])
     pushLog('info', '开始一键配置：' + (selectedIds.map((id) => TARGET_NAMES[id] || id).join('、') || '无目标'))
     try {
       const res = await fetch('/api/oneclick', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', [TOKEN_HEADER]: TOKEN },
-        body: JSON.stringify({ baseUrl, apiKey, targets: selectedIds, codexMode, proxyAutostart, autoUpdate, defaultModel, checkedModels: [...checkedIds], workbuddyAutoUpdate: autoUpdate.workbuddy !== false }),
+        body: JSON.stringify({ baseUrl, apiKey, targets: selectedIds, codexMode, proxyAutostart, autoUpdate, defaultModel, checkedModels, workbuddyAutoUpdate: autoUpdate.workbuddy !== false }),
       })
       if (!res.ok || !res.body) throw new Error('HTTP ' + res.status)
       const reader = res.body.getReader()

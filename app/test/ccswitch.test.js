@@ -52,9 +52,49 @@ test('syncCodexModelCatalog：cc-switch 投影目录统一为默认 xhigh + 五�
       for (const l of m.supported_reasoning_levels) assert.ok(l.description, '档位描述不应为空')
     }
     assert.ok(msg.includes('2 个模型'), '消息应包含模型数：' + msg)
+    assert.ok(msg.includes('上下文兜底修正 2 个'), '缺失 context 字段应被兜底：' + msg)
+    for (const m of cat.models) {
+      assert.strictEqual(m.context_window, 272000, m.slug + ' 缺失的 context_window 应兜底为 272000')
+      assert.strictEqual(m.max_context_window, 272000, m.slug + ' 缺失的 max_context_window 应兜底为 272000')
+    }
     // 幂等：再次执行不再变更
     const msg2 = cc.syncCodexModelCatalog(tmpHome)
     assert.ok(msg2.includes('已符合要求'), '二次执行应幂等：' + msg2)
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true })
+  }
+})
+
+test('syncCodexModelCatalog：上下文兜底（128000/缺失/0 → 272000；400000 不动；仅改 context 也落盘）', () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'tiancai-cat-cw-'))
+  try {
+    const p = cc.codexCatalogPath(tmpHome)
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    // 档位已合规的条目，仅 context 字段存在差异 → 验证 changed 判定包含 cwChanged、确实落盘
+    const okLevels = () => cc.CODEX_CATALOG_LEVELS.map((l) => ({ ...l }))
+    fs.writeFileSync(p, JSON.stringify({
+      models: [
+        { slug: 'm-unknown-128k', priority: 1001, default_reasoning_level: 'xhigh', supported_reasoning_levels: okLevels(), context_window: 128000, max_context_window: 128000 },
+        { slug: 'm-missing-cw', priority: 1002, default_reasoning_level: 'xhigh', supported_reasoning_levels: okLevels() },
+        { slug: 'm-real-400k', priority: 1003, default_reasoning_level: 'xhigh', supported_reasoning_levels: okLevels(), context_window: 400000, max_context_window: 400000 },
+        { slug: 'm-zero-cw', priority: 1004, default_reasoning_level: 'xhigh', supported_reasoning_levels: okLevels(), context_window: 0, max_context_window: 0 },
+      ],
+    }))
+    const msg = cc.syncCodexModelCatalog(tmpHome)
+    const cat = JSON.parse(fs.readFileSync(p, 'utf8'))
+    const bySlug = Object.fromEntries(cat.models.map((m) => [m.slug, m]))
+    assert.strictEqual(bySlug['m-unknown-128k'].context_window, 272000, '128000（cc-switch 未知模型投影默认）应兜底为 272000')
+    assert.strictEqual(bySlug['m-unknown-128k'].max_context_window, 272000, 'max_context_window=128000 应兜底为 272000')
+    assert.strictEqual(bySlug['m-missing-cw'].context_window, 272000, '缺失 context_window 应补 272000')
+    assert.strictEqual(bySlug['m-missing-cw'].max_context_window, 272000, '缺失 max_context_window 应补 272000')
+    assert.strictEqual(bySlug['m-real-400k'].context_window, 400000, '真实取值 400000 不应被改动')
+    assert.strictEqual(bySlug['m-real-400k'].max_context_window, 400000, '真实取值 400000 不应被改动')
+    assert.strictEqual(bySlug['m-zero-cw'].context_window, 272000, 'context_window=0（手工编辑/损坏数据）应兜底为 272000')
+    assert.strictEqual(bySlug['m-zero-cw'].max_context_window, 272000, 'max_context_window=0 应兜底为 272000')
+    assert.ok(msg.includes('上下文兜底修正 3 个'), 'summary 应体现兜底数量：' + msg)
+    // 幂等：兜底完成后再次执行不再变更
+    const msg2 = cc.syncCodexModelCatalog(tmpHome)
+    assert.ok(msg2.includes('已符合要求'), '兜底后二次执行应幂等：' + msg2)
   } finally {
     fs.rmSync(tmpHome, { recursive: true, force: true })
   }
