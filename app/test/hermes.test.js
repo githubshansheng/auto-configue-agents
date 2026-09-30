@@ -429,3 +429,204 @@ test('混合行尾（部分 \\n 部分 \\r\\n）也能解析与配置', () => {
   assert.ok(/^  api_key: "sk-test-abc123"$/m.test(out), out)
   assert.ok(out.includes('  name: "my-agent"'), '后续段原样')
 })
+
+// ─── providers 段 + model_aliases 直连表：中转站模型全量声明与路由兜底 ───
+// 背景（2026-09-29 用户定规 + 真机实测根因）：
+// 1) 中转站新增模型（gpt-6.1-sol）要全量声明进 providers entry，名单外 272k；
+// 2) hermes -z --model 不带 --provider 时 oneshot 按 gpt-* 猜到 openai-api 报
+//    "No usable credentials"——model_aliases 直连表是官方旁路。
+
+// CFG2：带模型列表（混合形态：字符串 + {id} 对象 + 重复项，验证归一去重保序）
+const CFG2 = {
+  baseUrl: 'https://ai.heigh.vip',
+  apiKey: 'sk-test-abc123',
+  defaultModel: 'glm-5.3-flash',
+  models: ['MiniMax-M3', 'gpt-6.1-sol', { id: 'sol-new-model-x' }, 'MiniMax-M3'],
+}
+
+// models.dev 缓存夹具：gpt-6.1-sol 故意混合大小写（验证小写归一匹配）
+const CACHE = {
+  openai: { id: 'openai', models: { 'GPT-6.1-Sol': { context_length: 400000 } } },
+  zhipu: { id: 'zhipu', models: { 'minimax-m3': { context_length: 1000000 }, 'glm-5.3-flash': {} } },
+}
+
+function writeCache(home, obj) {
+  fs.writeFileSync(path.join(home, '.hermes', 'models_dev_cache.json'), JSON.stringify(obj))
+}
+
+function mkHomeWithCache() {
+  const home = mkHome()
+  writeCache(home, CACHE)
+  return home
+}
+
+test('modelsDevKnown：解析缓存为小写集合；缺失/损坏返回 null', () => {
+  const home = mkHome()
+  assert.strictEqual(hermes.modelsDevKnown(home), null, '缓存缺失 → null（全部按未知兜底）')
+  writeCache(home, CACHE)
+  const known = hermes.modelsDevKnown(home)
+  assert.ok(known instanceof Set)
+  assert.ok(known.has('gpt-6.1-sol'), '混合大小写键按小写归一')
+  assert.ok(known.has('minimax-m3'))
+  writeCache(home, '{oops')
+  assert.strictEqual(hermes.modelsDevKnown(home), null, '损坏 JSON → null')
+})
+
+test('providerEntryPlan：已知不覆盖（null）/未知 272000/名单不可用全 272000/去重保序/entry 名推导', () => {
+  const known = hermes.modelsDevKnown(mkHomeWithCache())
+  const e = hermes.providerEntryPlan(CFG2, known)
+  assert.strictEqual(e.name, 'ai-heigh-vip')
+  assert.strictEqual(e.baseUrl, 'https://ai.heigh.vip/v1')
+  assert.deepStrictEqual(e.models.map((m) => m.id), ['MiniMax-M3', 'gpt-6.1-sol', 'sol-new-model-x'], '去重保序 + 对象形态归一')
+  assert.strictEqual(e.models[0].ctx, null, '名单内（minimax-m3）不覆盖上下文')
+  assert.strictEqual(e.models[1].ctx, null, '名单内（gpt-6.1-sol）不覆盖上下文')
+  assert.strictEqual(e.models[2].ctx, 272000, '名单外按 272000 兜底')
+  assert.strictEqual(hermes.UNKNOWN_MODEL_CONTEXT_LENGTH, 272000)
+  const e2 = hermes.providerEntryPlan(CFG2, null)
+  assert.ok(e2.models.every((m) => m.ctx === 272000), '名单缓存不可用 → 全部按未知兜底 272000')
+  assert.strictEqual(hermes.providerEntryName('https://ai.heigh.vip/v1'), 'ai-heigh-vip')
+})
+
+test('configure：providers entry + model_aliases 写入（无 providers 行 → 末尾追加），其他段零改动', () => {
+  const home = mkHomeWithCache()
+  writeFixture(home)
+  const items = hermes.configure(home, CFG2)
+  assert.strictEqual(items.length, 3, 'model 段 + providers + model_aliases 三项摘要')
+  assert.ok(items[1].summary.includes('ai-heigh-vip') && items[1].summary.includes('272k'), items[1].summary)
+  assert.ok(items[2].summary.includes('model_aliases'), items[2].summary)
+  const out = fs.readFileSync(hermes.configPath(home), 'utf8')
+  assert.ok(/^providers:$/m.test(out), '顶层 providers:（块级）')
+  assert.ok(out.includes('  ai-heigh-vip:'), 'entry 名 hostname 推导')
+  assert.ok(out.includes('    base_url: "https://ai.heigh.vip/v1"'), out)
+  assert.ok(/^    api_key: "sk-test-abc123"$/m.test(out), out)
+  assert.ok(out.includes('      MiniMax-M3: {}'), '名单内：空映射不覆盖上下文')
+  assert.ok(out.includes('      gpt-6.1-sol: {}'), '新增已知模型同样声明')
+  assert.ok(out.includes('      sol-new-model-x:\n        context_length: 272000'), '名单外：272k 兜底')
+  assert.strictEqual((out.match(/^ {6}MiniMax-M3: \{\}$/gm) || []).length, 1, '重复项去重只声明一次')
+  assert.ok(/^model_aliases:$/m.test(out), 'model_aliases 直连表')
+  assert.ok(out.includes('  gpt-6.1-sol: {model: "gpt-6.1-sol", provider: custom, base_url: "https://ai.heigh.vip/v1"}'), 'gpt-6.1-sol 直连别名')
+  // 其他段零改动 + 三件套照常 + default 不动
+  assert.ok(out.includes('  provider: "custom"'), out)
+  assert.ok(out.includes('  default: "anthropic/claude-opus-4.6"'), 'default 原样')
+  assert.ok(out.includes('agent:\n  name: "my-agent"\n  workspace: "/tmp/ws"'), 'agent 段原样')
+  assert.ok(out.includes('gateway:\n  platform: "telegram"'), 'gateway 段原样')
+})
+
+test('configure：providers: {} 空映射 → 原位展开为块级', () => {
+  const home = mkHomeWithCache()
+  writeFixture(home)
+  const p = hermes.configPath(home)
+  fs.writeFileSync(p, fs.readFileSync(p, 'utf8').replace('gateway:', 'providers: {}\ngateway:'))
+  hermes.configure(home, CFG2)
+  const out = fs.readFileSync(p, 'utf8')
+  assert.ok(!out.includes('providers: {}'), '空映射已展开')
+  assert.ok(/^providers:$/m.test(out))
+  assert.ok(out.includes('      gpt-6.1-sol: {}'))
+  assert.ok(out.includes('gateway:\n  platform: "telegram"'), '后续段原样')
+})
+
+test('configure：已有 providers 块级 entry → 同名原位重写，异名 entry 与既有子键保留', () => {
+  const home = mkHomeWithCache()
+  const p = hermes.configPath(home)
+  fs.writeFileSync(p, FIXTURE.replace('gateway:', [
+    'providers:',
+    '  other-relay:',
+    '    base_url: "https://other.example/v1"',
+    '    api_key: "sk-other"',
+    '    models:',
+    '      legacy-model:',
+    '        context_length: 128000',
+    '  ai-heigh-vip:',
+    '    base_url: "https://stale.example/v1"',
+    '    models:',
+    '      stale-model: {}',
+    'gateway:',
+  ].join('\n')))
+  hermes.configure(home, CFG2)
+  const out = fs.readFileSync(p, 'utf8')
+  assert.ok(out.includes('  other-relay:\n    base_url: "https://other.example/v1"'), '异名 entry 原样')
+  assert.ok(out.includes('      legacy-model:\n        context_length: 128000'), '异名 entry 子键原样')
+  assert.ok(!out.includes('stale.example'), '同名 entry 旧内容清除')
+  assert.ok(!out.includes('stale-model'), '同名 entry 旧模型清除')
+  assert.ok(out.includes('    base_url: "https://ai.heigh.vip/v1"'), '同名 entry 重写为新 base_url')
+  assert.strictEqual((out.match(/^  ai-heigh-vip:$/gm) || []).length, 1, 'entry 不重复')
+})
+
+test('model_aliases：用户自建 alias 原样保留，同名键归中转站管理（块级形态整块替换）', () => {
+  const home = mkHomeWithCache()
+  writeFixture(home)
+  const p = hermes.configPath(home)
+  fs.writeFileSync(p, fs.readFileSync(p, 'utf8').replace('gateway:', [
+    'model_aliases:',
+    '  my-custom-alias:',
+    '    model: "some-other-model"',
+    '    provider: openrouter',
+    '    base_url: "https://openrouter.ai/api/v1"',
+    '  gpt-6.1-sol:',
+    '    model: "wrong-target"',
+    '    provider: somewhere',
+    '    base_url: "https://wrong.example/v1"',
+    'gateway:',
+  ].join('\n')))
+  hermes.configure(home, CFG2)
+  const out = fs.readFileSync(p, 'utf8')
+  assert.ok(out.includes('  my-custom-alias:'), '用户自建 alias 保留')
+  assert.ok(out.includes('    model: "some-other-model"'), '用户 alias 块级内容原样')
+  assert.ok(!out.includes('wrong-target'), '同名键旧块清除')
+  assert.ok(out.includes('  gpt-6.1-sol: {model: "gpt-6.1-sol", provider: custom, base_url: "https://ai.heigh.vip/v1"}'), '同名键重写为中转站直连')
+  assert.strictEqual((out.match(/^  gpt-6\.1-sol:/gm) || []).length, 1, '不重复')
+})
+
+test('幂等（含 providers + model_aliases）：CFG2 重跑产物逐字节一致', () => {
+  const home = mkHomeWithCache()
+  writeFixture(home)
+  hermes.configure(home, CFG2)
+  const a = fs.readFileSync(hermes.configPath(home), 'utf8')
+  hermes.configure(home, CFG2)
+  const b = fs.readFileSync(hermes.configPath(home), 'utf8')
+  assert.strictEqual(b, a)
+})
+
+test('verify：providers + model_aliases 齐全通过；各自缺失分别 fail', () => {
+  const home = mkHomeWithCache()
+  writeFixture(home)
+  hermes.configure(home, CFG2)
+  const ok = hermes.verify(home, CFG2, { runProbe: () => ({ ok: true, detail: 'HTTP 200' }) })
+  assert.ok(ok.ok, ok.message)
+  const p = hermes.configPath(home)
+  const full = fs.readFileSync(p, 'utf8')
+  // 仅缺 alias（providers 完好）→ fail 于 model_aliases
+  // （alias 是追加段最后一行、无结尾 \n，正则必须容忍行尾无换行）
+  fs.writeFileSync(p, full.replace(/^  sol-new-model-x: \{.*\}(\n|$)/m, ''))
+  const badAlias = hermes.verify(home, CFG2, { runProbe: () => ({ ok: true, detail: 'HTTP 200' }) })
+  assert.ok(!badAlias.ok)
+  assert.ok(badAlias.message.includes('model_aliases'), badAlias.message)
+  // 仅缺 providers 声明（alias 完好）→ fail 于 providers
+  fs.writeFileSync(p, full.replace('      sol-new-model-x:\n        context_length: 272000\n', ''))
+  const badProv = hermes.verify(home, CFG2, { runProbe: () => ({ ok: true, detail: 'HTTP 200' }) })
+  assert.ok(!badProv.ok)
+  assert.ok(badProv.message.includes('providers'), badProv.message)
+})
+
+test('verify：providers entry base_url 被外部改动 → fail', () => {
+  const home = mkHomeWithCache()
+  writeFixture(home)
+  hermes.configure(home, CFG2)
+  const p = hermes.configPath(home)
+  fs.writeFileSync(p, fs.readFileSync(p, 'utf8').replace('    base_url: "https://ai.heigh.vip/v1"\n    api_key: "sk-test-abc123"\n    models:', '    base_url: "https://evil.example/v1"\n    api_key: "sk-test-abc123"\n    models:'))
+  const r = hermes.verify(home, CFG2, { runProbe: () => ({ ok: true, detail: 'x' }) })
+  assert.ok(!r.ok)
+  assert.ok(r.message.includes('base_url'), r.message)
+})
+
+test('plan：cfg.models 时返回三项（model 段 + providers + model_aliases），providers 摘要含 272k 与计数', () => {
+  const home = mkHomeWithCache()
+  writeFixture(home)
+  const items = hermes.plan(home, CFG2)
+  assert.strictEqual(items.length, 3)
+  assert.ok(items[1].summary.includes('providers.ai-heigh-vip'), items[1].summary)
+  assert.ok(items[1].summary.includes('3 个'), items[1].summary)
+  assert.ok(items[1].summary.includes('272k'), items[1].summary)
+  assert.ok(items[1].summary.includes('（1 个）'), '未知模型计数：' + items[1].summary)
+  assert.ok(items[2].summary.includes('model_aliases'), items[2].summary)
+})

@@ -10,6 +10,21 @@
 //    选过就留着，没选过就保持注释态）。实测：无 default 时 hermes 发空模型名
 //    （HTTP 400 Model name not specified），所以端到端探针必须用 --model 显式
 //    指定模型（cfg.defaultModel，即工具默认模型）。
+// 3) providers 段（2026-09-29 用户定规）：中转站支持的全部模型全量声明进顶层
+//    providers 段（entry 名由 base_url hostname 推导，hermes 按归一化 base_url
+//    匹配 entry）；其中 models.dev 注册表缓存（$HERMES_HOME/models_dev_cache.json）
+//    已收录的模型写空映射（不覆盖上下文，交由 hermes 真实元数据解析），名单外的
+//    新模型（如 gpt-6.1-sol）一律 context_length: 272000 兜底——解决「中转站新增
+//    模型后 hermes 缺少显式声明」的问题。名单缓存缺失或损坏时按「全部未知」处理
+//    （全部 272k），与用户规则一致。cfg.models 未提供时整段跳过（绝不写空 entry）；
+//    default 模型仍然绝不写入。
+// 4) model_aliases 直连表（2026-09-29 真机实测根因）：hermes -z --model 不带
+//    --provider 时 oneshot.py 先查 model_aliases 生成的 DIRECT_ALIASES，查不到才
+//    走 detect_provider_for_model 按名猜测——gpt-* 模型会被猜到 openai-api，报
+//    "agent init failed: No usable credentials found for provider 'openai-api'"。
+//    把中转站全部模型写进 model_aliases（provider: custom + base_url）后直连中转
+//    站；TUI /model 切模型则由 providers entry 的 models dict 兜住（model_switch
+//    step d.5 _configured_provider_matches 精确匹配声明模型，优先于按名猜测）。
 // 关键约束：config.yaml 是 hermes 的完整主配置（500+ 行注释 + 用户自定义段），
 // 绝不能整文件重写——只做行级原位替换，注释与其他段一字不动。
 // 鉴权说明：key 直接写入 model.api_key（hermes 官方注释支持的用法）；
@@ -92,6 +107,312 @@ function normalizeBase(baseUrl) {
 // yamlQuote 输出 YAML 双引号字符串（反斜杠与双引号转义）。
 function yamlQuote(v) {
   return '"' + String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
+}
+
+// ── providers 段：中转站模型全量声明 + 名单外模型 272k 兜底（2026-09-29 用户定规）──
+// 背景：中转站新增模型（如 gpt-6.1-sol）不在 hermes 的 models.dev 注册表缓存里，
+// 缺少显式声明。定规：把中转站支持的全部模型显式声明进顶层 providers 段，名单内
+// 已知模型不覆盖上下文（交由 hermes 真实元数据解析），名单外模型一律 272k。
+
+// 名单外模型的上下文兜底值（用户指定 272k）。
+const UNKNOWN_MODEL_CONTEXT_LENGTH = 272000
+
+// modelsDevKnown 读取 $HERMES_HOME/models_dev_cache.json（hermes 官方 models.dev
+// 注册表缓存，结构 { providerId: { ..., models: { modelId: {...} } } }），返回小写
+// 模型 id 集合；读取/解析失败返回 null（调用方按「全部未知」兜底 272k——名单不可
+// 用即视为不在名单，与用户规则一致）。
+function modelsDevKnown(home) {
+  let raw
+  try {
+    raw = fs.readFileSync(path.join(hermesHome(home), 'models_dev_cache.json'), 'utf8')
+  } catch {
+    return null
+  }
+  try {
+    const root = JSON.parse(raw)
+    // 根必须是无数组对象：字符串/数字/数组等「合法 JSON 但非注册表形态」→ null
+    // （JSON.stringify 会把非对象输入序列化为带引号字符串，Object.values 会逐字符
+    // 迭代出空 Set 而非 null——实测踩过，必须显式校验）。
+    if (!root || typeof root !== 'object' || Array.isArray(root)) return null
+    const known = new Set()
+    for (const prov of Object.values(root)) {
+      const models = prov && typeof prov === 'object' ? prov.models : null
+      if (!models || typeof models !== 'object') continue
+      for (const id of Object.keys(models)) {
+        const k = String(id).trim().toLowerCase()
+        if (k) known.add(k)
+      }
+    }
+    return known
+  } catch {
+    return null
+  }
+}
+
+// providerEntryName 由 base_url 推导 providers entry 键名：hostname 小写化、非
+// [a-z0-9] 折叠为连字符（https://ai.heigh.vip/v1 → ai-heigh-vip）。hermes 按
+// 归一化 base_url 匹配 entry（hermes_cli/config.py），键名仅作标识。
+function providerEntryName(baseUrl) {
+  let host = ''
+  try {
+    host = new URL(String(baseUrl || '')).hostname
+  } catch {}
+  const name = host.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  return name || 'custom-relay'
+}
+
+// modelIds 归一 cfg.models：兼容字符串数组与 [{id}] 对象数组（oneclick 两种形态），
+// 去空去重保序。
+function modelIds(models) {
+  const out = []
+  const seen = new Set()
+  for (const m of Array.isArray(models) ? models : []) {
+    const id = String(typeof m === 'object' && m !== null ? m.id : m || '').trim()
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  return out
+}
+
+// providerEntryPlan 生成 providers entry 目标结构 { name, baseUrl, apiKey,
+// models: [{ id, ctx }] }：ctx=null 表示名单内已知模型（写空映射 {}，不覆盖上下文）；
+// ctx=272000 表示名单外/名单不可用。knownSet 为 null（缓存缺失/损坏）时全部按未知兜底。
+function providerEntryPlan(cfg, knownSet) {
+  const known = knownSet instanceof Set ? knownSet : null
+  return {
+    name: providerEntryName(cfg.baseUrl),
+    baseUrl: normalizeBase(cfg.baseUrl),
+    apiKey: String(cfg.apiKey || ''),
+    models: modelIds(cfg.models).map((id) => ({
+      id,
+      ctx: known && known.has(id.toLowerCase()) ? null : UNKNOWN_MODEL_CONTEXT_LENGTH,
+    })),
+  }
+}
+
+// yamlPlainKey 模型 id / entry 名作 YAML 键：常规字符裸写（可读），其余双引号
+// （hermes 用 PyYAML 解析，两种写法等价）。
+function yamlPlainKey(id) {
+  return /^[A-Za-z0-9._/][A-Za-z0-9._/-]*$/.test(id) ? id : yamlQuote(id)
+}
+
+// renderEntryBlock 输出 entry 块行（不含顶层 providers: 行，缩进 2 起）：
+//   ai-heigh-vip:
+//     base_url: "..."
+//     api_key: "..."
+//     models:
+//       MiniMax-M3: {}
+//       gpt-6.1-sol:
+//         context_length: 272000
+function renderEntryBlock(entry) {
+  const out = [
+    '  ' + yamlPlainKey(entry.name) + ':',
+    '    base_url: ' + yamlQuote(entry.baseUrl),
+    '    api_key: ' + yamlQuote(entry.apiKey),
+  ]
+  if (entry.models.length > 0) {
+    out.push('    models:')
+    for (const m of entry.models) {
+      if (m.ctx == null) {
+        out.push('      ' + yamlPlainKey(m.id) + ': {}')
+      } else {
+        out.push('      ' + yamlPlainKey(m.id) + ':')
+        out.push('        context_length: ' + m.ctx)
+      }
+    }
+  }
+  return out
+}
+
+// applyProviderEntry 把 entry 原位写入行数组（幂等，绝不动其他顶层段）：
+// A) `providers: {}` → 原位展开为块级；B) 块级 → 同名 entry 原位重写（compact 空
+// 映射 entry 也支持）、异名 entry 插入段首；C) 无 providers: → 文件末尾追加
+// （YAML 顶层键顺序无关）。无法行级安全改写的形态（如带内容的 flow 映射）→ 不动
+// 文件返回 skipped（fail-open：model 段三件套已另行配置，不受影响）。
+// 注意只匹配顶格 providers:——model_catalog 等段内缩进的 providers: 不算。
+function applyProviderEntry(lines, entry) {
+  const out = lines.slice()
+  const block = renderEntryBlock(entry)
+  const topIdx = out.findIndex((l) => l.startsWith('providers:'))
+  if (topIdx === -1) {
+    return { lines: out.concat(['providers:'], block), action: 'appended' }
+  }
+  const rest = out[topIdx].slice('providers:'.length).trim()
+  if (rest !== '' && rest !== '{}') {
+    return { lines: out, action: 'skipped', note: 'providers 段为特殊形态（' + rest.slice(0, 24) + '），跳过模型声明（model 段已另行配置）' }
+  }
+  if (rest === '{}') {
+    out.splice(topIdx, 1, 'providers:', ...block)
+    return { lines: out, action: 'expanded' }
+  }
+  // 块级：段范围 [topIdx+1, sectEnd)（顶格非空行止），找同名 entry 子块
+  let sectEnd = out.length
+  for (let i = topIdx + 1; i < out.length; i++) {
+    const l = out[i]
+    if (l.trim() === '' || l.startsWith('#')) continue
+    if (!l.startsWith(' ')) {
+      sectEnd = i
+      break
+    }
+  }
+  let cs = -1
+  let firstChild = -1
+  for (let i = topIdx + 1; i < sectEnd; i++) {
+    const l = out[i]
+    if (l.trim() === '' || l.startsWith('#') || l.startsWith('   ')) continue
+    const m = l.match(/^ {2}(.+?)\s*:\s*(\{\s*\})?\s*$/)
+    if (!m) continue
+    if (firstChild === -1) firstChild = i
+    if (m[1].replace(/^"|"$/g, '').trim() === entry.name) {
+      cs = i
+      break
+    }
+  }
+  if (cs === -1) {
+    out.splice(firstChild === -1 ? topIdx + 1 : firstChild, 0, ...block)
+    return { lines: out, action: 'inserted' }
+  }
+  // 子块终点：下一个恰 2 空格缩进的 entry 名行 / 段结束（空行与注释不作为边界）
+  let ce = sectEnd
+  for (let i = cs + 1; i < sectEnd; i++) {
+    const l = out[i]
+    if (l.trim() === '' || l.startsWith('#') || l.startsWith('   ')) continue
+    ce = i
+    break
+  }
+  out.splice(cs, ce - cs, ...block)
+  return { lines: out, action: 'replaced' }
+}
+
+// parseProviderEntry 只读解析顶层 providers 段中名为 name 的 entry（verify 用）。
+// 返回 { baseUrl, apiKey, models: { id: number|null } }；entry 不存在返回 null。
+// models 值：number=显式 context_length；null=已声明无覆盖（{} 空映射）。
+// 匹配顺序：8 空格 context_length → 4 空格 entry 键 → 6 空格模型键（缩进前缀
+// 互为包含，必须先长后短；6 空格键首字符禁空白防止吞掉 8 空格行）。
+function parseProviderEntry(lines, name) {
+  const topIdx = lines.findIndex((l) => l === 'providers:' || /^providers:\s*\{\s*\}\s*$/.test(l))
+  if (topIdx === -1) return null
+  let cs = -1
+  for (let i = topIdx + 1; i < lines.length; i++) {
+    const l = lines[i]
+    if (l.trim() === '' || l.startsWith('#') || l.startsWith('   ')) continue
+    if (!l.startsWith(' ')) break // 顶格键 → providers 段结束
+    const m = l.match(/^ {2}(.+?)\s*:\s*(\{\s*\})?\s*$/)
+    if (m && m[1].replace(/^"|"$/g, '').trim() === name) {
+      cs = i
+      break
+    }
+  }
+  if (cs === -1) return null
+  const res = { baseUrl: '', apiKey: '', models: {} }
+  // inModels：进入 models 子映射后保持 true——用 cur==='models' 做门卫是错的
+  // （解析完第一个模型行 cur 就变成模型 id，后续模型行全被漏掉，实测踩过）。
+  let inModels = false
+  let cur = null
+  for (let i = cs + 1; i < lines.length; i++) {
+    const l = lines[i]
+    if (l.trim() === '' || l.trimStart().startsWith('#')) continue
+    if (!l.startsWith('   ')) break // 下一个 entry 名行 / 顶格键 → entry 结束
+    let m = l.match(/^ {8}context_length\s*:\s*(\d+)\s*$/)
+    if (m && cur) {
+      res.models[cur] = parseInt(m[1], 10)
+      continue
+    }
+    m = l.match(/^ {4}([A-Za-z_]+)\s*:\s*(.*)$/)
+    if (m) {
+      const v = (m[2] || '').replace(/^"(.*)"$/, '$1').trim()
+      if (m[1] === 'base_url') res.baseUrl = v
+      else if (m[1] === 'api_key') res.apiKey = v
+      inModels = m[1] === 'models'
+      continue
+    }
+    m = l.match(/^ {6}([^\s].+?)\s*:\s*(\{\s*\})?\s*$/)
+    if (m && inModels) {
+      cur = m[1].replace(/^"|"$/g, '').trim()
+      res.models[cur] = m[2] ? null : undefined
+    }
+  }
+  return res
+}
+
+// applyModelAliases 把中转站全部模型写进顶层 model_aliases 直连表（oneshot
+// `--model X` 的官方路由旁路：oneshot.py 先查 model_aliases 生成的 DIRECT_ALIASES
+// 再走按名猜测——没有该表时 gpt-* 模型被猜到 openai-api，报 "No usable
+// credentials found for provider 'openai-api'"，2026-09-29 真机实测）。
+// 每模型一行 flow 映射（键=模型 id，provider: custom + base_url 直连中转站）；
+// 只覆写与中转站模型同名的键（含用户手写的块级形态，整块替换），其余 alias
+// 原样保留；无该段则末尾追加；`model_aliases: {}` 原位展开；特殊形态跳过。
+function applyModelAliases(lines, entry) {
+  const aliasLine = (id) =>
+    '  ' + yamlPlainKey(id) + ': {model: ' + yamlQuote(id) + ', provider: custom, base_url: ' + yamlQuote(entry.baseUrl) + '}'
+  const want = new Map(entry.models.map((m) => [m.id, aliasLine(m.id)]))
+  const out = lines.slice()
+  const topKey = 'model_aliases:'
+  const topIdx = out.findIndex((l) => l.startsWith(topKey))
+  if (topIdx === -1) {
+    return { lines: out.concat([topKey], [...want.values()]), action: 'appended', count: want.size }
+  }
+  const rest = out[topIdx].slice(topKey.length).trim()
+  if (rest !== '' && rest !== '{}') {
+    return { lines: out, action: 'skipped', note: 'model_aliases 段为特殊形态（' + rest.slice(0, 24) + '），跳过直连表写入' }
+  }
+  if (rest === '{}') {
+    out.splice(topIdx, 1, topKey, ...want.values())
+    return { lines: out, action: 'expanded', count: want.size }
+  }
+  // 块级：逐键 upsert（同名键整块替换为单行 flow；其余键原样保留）
+  const ops = [] // [startIdx, replaceCount, replacementLine]，自底向上应用
+  const replacedKeys = new Set()
+  let firstChild = -1
+  let i = topIdx + 1
+  while (i < out.length) {
+    const l = out[i]
+    if (l.trim() === '' || l.startsWith('#')) {
+      i++
+      continue
+    }
+    if (!l.startsWith(' ')) break // 顶格键 → 段结束
+    if (!l.startsWith('  ') || l.startsWith('   ')) {
+      i++ // 异常缩进/键块子行，跳过
+      continue
+    }
+    // `(\{.*\})?` 必须容忍带内容的 flow 映射值（我们写入的 alias 行就是
+    // `键: {model: ..., provider: ...}`——只认 `\{\s*\}` 会导致重跑时认不出
+    // 自己写的行、整表重复插入，幂等破坏，实测踩过）。
+    const m = l.match(/^ {2}(.+?)\s*:\s*(\{.*\})?\s*(#.*)?$/)
+    if (firstChild === -1) firstChild = i
+    if (m) {
+      const key = m[1].replace(/^"|"$/g, '').trim()
+      if (want.has(key)) {
+        // 键块范围：flow 单行或块级子行（缩进 ≥3），止于下一个 2 空格键 / 顶格行
+        let j = i + 1
+        while (j < out.length) {
+          const lj = out[j]
+          if (lj.trim() === '' || lj.startsWith('   ')) {
+            j++
+            continue
+          }
+          break
+        }
+        ops.push([i, j - i, want.get(key)])
+        replacedKeys.add(key)
+        i = j
+        continue
+      }
+    }
+    i++
+  }
+  for (let k = ops.length - 1; k >= 0; k--) {
+    const [start, count, line] = ops[k]
+    out.splice(start, count, line)
+  }
+  const missing = [...want.keys()].filter((k) => !replacedKeys.has(k))
+  if (missing.length > 0) {
+    const at = firstChild === -1 ? topIdx + 1 : firstChild
+    out.splice(at, 0, ...missing.map((k) => want.get(k)))
+  }
+  return { lines: out, action: replacedKeys.size > 0 ? 'updated' : 'inserted', count: want.size }
 }
 
 // 编辑计划：model 段内需生效的三字段目标值（服务提供方三件套）。
@@ -237,7 +558,30 @@ function plan(home, cfg) {
     return { key: k, from: ov, to: nv }
   })
   const summary = '原位更新 model 段（仅服务提供方，不动 default 模型）：' + items.map((i) => i.key + ' ' + i.from + ' → ' + i.to).join('；')
-  return [{ file: p, summary, diff: items }]
+  const result = [{ file: p, summary, diff: items }]
+  // providers + model_aliases 计划（cfg.models 未提供则整段跳过）
+  const ids = modelIds(cfg.models)
+  if (ids.length > 0) {
+    const entry = providerEntryPlan(cfg, modelsDevKnown(home))
+    const unknownCount = entry.models.filter((m) => m.ctx != null).length
+    const diff = entry.models.slice(0, 20).map((m) => ({
+      key: m.id,
+      from: '（未声明）',
+      to: m.ctx == null ? '已声明（上下文交由 hermes 解析）' : 'context_length: 272000',
+    }))
+    if (entry.models.length > 20) diff.push({ key: '…', from: '', to: '其余 ' + (entry.models.length - 20) + ' 个同理' })
+    result.push({
+      file: p,
+      summary: '写入 providers.' + entry.name + '：全量声明 ' + entry.models.length + ' 个中转站模型；名单外模型 context_length 默认 272k（' + unknownCount + ' 个）',
+      diff,
+    })
+    result.push({
+      file: p,
+      summary: '写入 model_aliases 直连表：' + entry.models.length + ' 个模型 provider=custom 直连中转站（hermes -z --model 不再按名误判 openai-api）',
+      diff: [{ key: 'model_aliases', from: '（无直连表）', to: entry.models.length + ' 个模型 → ' + entry.baseUrl }],
+    })
+  }
+  return result
 }
 
 function backup(home) {
@@ -269,15 +613,41 @@ function configure(home, cfg) {
   const before = lines.join('\n')
   const { lines: out, changed, missing } = applyEdits(lines, editPlan(cfg))
   if (missing.length === 3) throw new Error('model 段无可编辑字段（config 结构异常）')
-  const after = out.join('\n')
-  if (before !== after) atomicWrite(p, out)
+  let finalLines = out
+  const items = [{ file: p, summary: 'model 段已更新（' + changed.join('/') + '）' }]
+  // providers entry + model_aliases 直连表：中转站模型全量声明与直连路由
+  // （cfg.models 未提供时整段跳过——与「绝不写空 entry」约定一致）
+  const ids = modelIds(cfg.models)
+  if (ids.length > 0) {
+    const entry = providerEntryPlan(cfg, modelsDevKnown(home))
+    const prov = applyProviderEntry(finalLines, entry)
+    finalLines = prov.lines
+    const unknownCount = entry.models.filter((m) => m.ctx != null).length
+    if (prov.action === 'skipped') {
+      items.push({ file: p, summary: 'providers 模型声明未写入：' + prov.note })
+    } else {
+      const actText = { expanded: '展开写入', replaced: '原位更新', inserted: '插入', appended: '在文件末尾追加' }[prov.action] || prov.action
+      items.push({
+        file: p,
+        summary: 'providers.' + entry.name + ' 已' + actText + '：全量声明 ' + entry.models.length + ' 个中转站模型，其中 ' + unknownCount + ' 个名单外模型按 272k 声明上下文（已知模型不覆盖，交由 hermes 元数据解析）',
+      })
+    }
+    const al = applyModelAliases(finalLines, entry)
+    finalLines = al.lines
+    if (al.action === 'skipped') {
+      items.push({ file: p, summary: 'model_aliases 直连表未写入：' + al.note })
+    } else {
+      items.push({
+        file: p,
+        summary: 'model_aliases 直连表已写入 ' + al.count + ' 个模型（hermes -z --model 直连中转站，修复 gpt-* 被按名误判 openai-api 报 No usable credentials 的问题）',
+      })
+    }
+  }
+  const after = finalLines.join('\n')
+  if (before !== after) atomicWrite(p, finalLines)
   const gw = restartGatewayIfRunning(home, resolveCli(home))
-  return [
-    {
-      file: p,
-      summary: 'model 段已更新（' + changed.join('/') + '）；' + gw,
-    },
-  ]
+  items[0].summary += '；' + gw
+  return items
 }
 
 // verify 两层：①读回断言三字段（服务提供方）与计划一致；②端到端 hermes -z "hi"
@@ -305,6 +675,32 @@ function verify(home, cfg, opts = {}) {
     }
   }
   if (!fields.api_key) return { ok: false, message: 'api_key 未写入' }
+  // providers entry + model_aliases 直连表读回断言（cfg.models 非空时）——
+  // 「新增模型看不见 / --model 路由误判 openai-api」的直接回归防线。
+  const ids = modelIds(cfg.models)
+  if (ids.length > 0) {
+    const entry = providerEntryPlan(cfg, null) // 仅用 name/baseUrl/模型 id 列表
+    const all = readLines(p)
+    const pe = parseProviderEntry(all, entry.name)
+    if (!pe) return { ok: false, message: 'providers.' + entry.name + ' 未写入（中转站模型声明缺失）' }
+    if (pe.baseUrl !== entry.baseUrl) {
+      return { ok: false, message: 'providers.' + entry.name + '.base_url 不一致：期望 ' + entry.baseUrl + '，实际 ' + (pe.baseUrl || '（空）') }
+    }
+    const missingIds = ids.filter((id) => !Object.prototype.hasOwnProperty.call(pe.models, id))
+    if (missingIds.length > 0) {
+      return { ok: false, message: 'providers 模型声明缺失 ' + missingIds.length + ' 个（' + missingIds.slice(0, 3).join(', ') + (missingIds.length > 3 ? ' …' : '') + '）' }
+    }
+    const topAliases = all.findIndex((l) => l.startsWith('model_aliases:'))
+    if (topAliases === -1) return { ok: false, message: 'model_aliases 直连表未写入（hermes -z --model 会按名误判 provider）' }
+    const missingAlias = ids.filter((id) => {
+      const esc = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const re = new RegExp('^ {2}("' + esc + '"|' + esc + ')\\s*:\\s*\\{.*provider:\\s*custom')
+      return !all.some((l) => re.test(l))
+    })
+    if (missingAlias.length > 0) {
+      return { ok: false, message: 'model_aliases 缺失 ' + missingAlias.length + ' 个（' + missingAlias.slice(0, 3).join(', ') + '）' }
+    }
+  }
   if (opts.runProbe) {
     const pr = opts.runProbe(home, cfg)
     if (!pr.ok) return pr
@@ -334,6 +730,7 @@ function rollback(receipt) {
 }
 
 module.exports = {
+  UNKNOWN_MODEL_CONTEXT_LENGTH,
   configPath,
   hermesHome,
   resolveCli,
@@ -341,6 +738,13 @@ module.exports = {
   loadModelSection,
   applyEdits,
   parseModelFields,
+  modelsDevKnown,
+  providerEntryName,
+  modelIds,
+  providerEntryPlan,
+  applyProviderEntry,
+  parseProviderEntry,
+  applyModelAliases,
   editPlan,
   detect,
   plan,
